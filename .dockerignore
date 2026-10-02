@@ -1,0 +1,17 @@
+.git
+.env
+.env.*
+!.env.example
+**/__pycache__
+**/*.py[cod]
+backend/.venv
+backend/data
+backend/tests
+backend/scripts
+frontend/node_modules
+frontend/dist
+emoji_test
+outputs
+work
+logs
+*.log
