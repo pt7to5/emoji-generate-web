@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from threading import Lock
+import tempfile
 
 import numpy as np
 import cv2
@@ -12,6 +13,7 @@ from .config import DATA_DIR
 
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "mobile_sam.pt"
+MAX_INFERENCE_SIDE = 1536
 os.environ.setdefault("YOLO_CONFIG_DIR", str(DATA_DIR))
 
 _model = None
@@ -159,45 +161,66 @@ def segment_from_positive_strokes(image_path: Path, points: list[list[float]], r
     if not prompts:
         raise ValueError("涂抹不能为空")
     model = _get_model()
-    image_size = Image.open(image_path).size
-    with _model_lock:
-        point_masks = _predict_masks(model, image_path, points=prompts, labels=[1] * len(prompts))
-        scored = [(_point_coverage(mask, prompts), int(mask.sum()), mask) for mask in point_masks if _valid_candidate(mask)]
-        if not scored:
-            fallback_box = _stroke_context_box(prompts, radius, image_size)
-            fallback_masks = [mask for mask in _predict_masks(model, image_path, bboxes=[fallback_box]) if _valid_candidate(mask)]
-            if not fallback_masks:
-                raise RuntimeError("未找到与涂抹范围对应的完整主体")
-            scored = [(_point_coverage(mask, prompts), int(mask.sum()), mask) for mask in fallback_masks]
-        anchor_covered, _, anchor = max(scored, key=lambda item: (item[0], item[1]))
-        anchor_box = _mask_bbox(anchor)
-        anchor_width, anchor_height = anchor_box[2] - anchor_box[0], anchor_box[3] - anchor_box[1]
-        anchor_span = max(anchor_width, anchor_height)
-        join_distance = max(radius * 2.5, anchor_span * .16)
-        relevant = [
-            mask for covered, _, mask in scored
-            if covered > 0
-            and covered >= max(1, anchor_covered * .12)
-            and _bbox_gap(anchor_box, _mask_bbox(mask)) <= join_distance
-            and (_mask_bbox(mask)[2] - _mask_bbox(mask)[0]) <= max(anchor_width * 1.55, radius * 6)
-            and (_mask_bbox(mask)[3] - _mask_bbox(mask)[1]) <= max(anchor_height * 1.55, radius * 6)
-        ]
-        seed = np.logical_or.reduce(relevant)
-        context_box = _expanded_context_box(seed, radius)
-        box_masks = _predict_masks(model, image_path, bboxes=[context_box])
+    with Image.open(image_path) as source:
+        image_size = source.size
+        inference_size = image_size
+        inference_path = image_path
+        temporary_path: Path | None = None
+        if max(image_size) > MAX_INFERENCE_SIDE:
+            inference = source.convert("RGB")
+            inference.thumbnail((MAX_INFERENCE_SIDE, MAX_INFERENCE_SIDE), Image.Resampling.LANCZOS)
+            inference_size = inference.size
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+            inference.save(temporary_path, "JPEG", quality=90)
+            inference_path = temporary_path
 
-    seed_area = int(seed.sum())
-    refinements: list[tuple[float, int, np.ndarray]] = []
-    for mask in box_masks:
-        if not _valid_candidate(mask):
-            continue
-        area = int(mask.sum())
-        coverage = _point_coverage(mask, prompts) / len(prompts)
-        if coverage >= .30 and area >= seed_area * .55 and area <= seed_area * 4.5:
-            refinements.append((coverage, area, mask))
-    result = max(refinements, key=lambda item: (item[0], item[1]))[2] if refinements else seed
-    result = _clean_subject_mask(result)
-    if _point_coverage(result, prompts) < max(1, round(len(prompts) * .30)):
-        raise RuntimeError("主体没有覆盖主要涂抹位置")
-    mask = Image.fromarray((result * 255).astype(np.uint8), "L")
-    return mask.resize(image_size, Image.Resampling.NEAREST)
+    scale_x = inference_size[0] / image_size[0]
+    scale_y = inference_size[1] / image_size[1]
+    inference_prompts = [[x * scale_x, y * scale_y] for x, y in prompts]
+    inference_radius = radius * min(scale_x, scale_y)
+    try:
+        with _model_lock:
+            point_masks = _predict_masks(model, inference_path, points=inference_prompts, labels=[1] * len(inference_prompts))
+            scored = [(_point_coverage(mask, inference_prompts), int(mask.sum()), mask) for mask in point_masks if _valid_candidate(mask)]
+            if not scored:
+                fallback_box = _stroke_context_box(inference_prompts, inference_radius, inference_size)
+                fallback_masks = [mask for mask in _predict_masks(model, inference_path, bboxes=[fallback_box]) if _valid_candidate(mask)]
+                if not fallback_masks:
+                    raise RuntimeError("未找到与涂抹范围对应的完整主体")
+                scored = [(_point_coverage(mask, inference_prompts), int(mask.sum()), mask) for mask in fallback_masks]
+            anchor_covered, _, anchor = max(scored, key=lambda item: (item[0], item[1]))
+            anchor_box = _mask_bbox(anchor)
+            anchor_width, anchor_height = anchor_box[2] - anchor_box[0], anchor_box[3] - anchor_box[1]
+            anchor_span = max(anchor_width, anchor_height)
+            join_distance = max(inference_radius * 2.5, anchor_span * .16)
+            relevant = [
+                mask for covered, _, mask in scored
+                if covered > 0
+                and covered >= max(1, anchor_covered * .12)
+                and _bbox_gap(anchor_box, _mask_bbox(mask)) <= join_distance
+                and (_mask_bbox(mask)[2] - _mask_bbox(mask)[0]) <= max(anchor_width * 1.55, inference_radius * 6)
+                and (_mask_bbox(mask)[3] - _mask_bbox(mask)[1]) <= max(anchor_height * 1.55, inference_radius * 6)
+            ]
+            seed = np.logical_or.reduce(relevant)
+            context_box = _expanded_context_box(seed, inference_radius)
+            box_masks = _predict_masks(model, inference_path, bboxes=[context_box])
+
+        seed_area = int(seed.sum())
+        refinements: list[tuple[float, int, np.ndarray]] = []
+        for mask in box_masks:
+            if not _valid_candidate(mask):
+                continue
+            area = int(mask.sum())
+            coverage = _point_coverage(mask, inference_prompts) / len(inference_prompts)
+            if coverage >= .30 and area >= seed_area * .55 and area <= seed_area * 4.5:
+                refinements.append((coverage, area, mask))
+        result = max(refinements, key=lambda item: (item[0], item[1]))[2] if refinements else seed
+        result = _clean_subject_mask(result)
+        if _point_coverage(result, inference_prompts) < max(1, round(len(inference_prompts) * .30)):
+            raise RuntimeError("主体没有覆盖主要涂抹位置")
+        mask = Image.fromarray((result * 255).astype(np.uint8), "L")
+        return mask.resize(image_size, Image.Resampling.NEAREST)
+    finally:
+        if temporary_path:
+            temporary_path.unlink(missing_ok=True)

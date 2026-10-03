@@ -83,6 +83,25 @@ async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, outp
     raise last_error
 
 
+def background_cache_path(folder: Path, object_id: str) -> Path:
+    mask_path = folder / f"mask_{object_id}.png"
+    version = mask_path.stat().st_mtime_ns
+    return folder / f"background_{object_id}_{version}.png"
+
+
+async def ensure_background_cache(folder: Path, object_id: str, input_path: Path) -> tuple[Path, bool]:
+    cache_path = background_cache_path(folder, object_id)
+    if cache_path.exists():
+        return cache_path, True
+    mask = Image.open(folder / f"mask_{object_id}.png").convert("L")
+    try:
+        await repair_background_with_retry(input_path, list(bbox_from_mask(mask)), cache_path)
+    except Exception:
+        cache_path.unlink(missing_ok=True)
+        raise
+    return cache_path, False
+
+
 def item_dir(image_id: str) -> Path:
     path = DATA_DIR / image_id
     if not path.exists():
@@ -236,6 +255,7 @@ async def refine(image_id: str, request: RefineRequest):
 
 @app.post("/api/images/{image_id}/refine-paint")
 async def refine_paint(image_id: str, request: PaintRefineRequest):
+    started = time.perf_counter()
     folder = item_dir(image_id); original_path = folder / "original.png"
     image = Image.open(original_path).convert("RGB")
     if any(len(point) != 2 for point in request.points):
@@ -255,6 +275,7 @@ async def refine_paint(image_id: str, request: PaintRefineRequest):
     preview, _ = cutout(image, mask); save_png(preview, folder / f"preview_{object_id}.png")
     payload = object_payload(image_id, object_id)
     payload["label"] = "手动涂抹主体"; payload["score"] = 1.0
+    logger.info("paint segmentation image_id=%s elapsed_ms=%d", image_id, round((time.perf_counter()-started)*1000))
     return payload
 
 
@@ -289,8 +310,11 @@ async def make_emoji(request: EmojiRequest):
     cutout_path = folder / f"cutout_{request.objectId}.png"; save_png(cutout_image, cutout_path)
     raw_path = folder / f"styled_{request.objectId}.png"
     output_path = folder / f"emoji_{request.objectId}_{uuid.uuid4().hex[:6]}.png"
+    background_started = time.perf_counter()
+    background_task = asyncio.create_task(ensure_background_cache(folder, request.objectId, original_path))
     try:
         # 每次点击都重新生成，避免提示词或蒙版改变后仍复用旧缓存。
+        generation_started = time.perf_counter()
         await generate_emoji_with_retry(cutout_path, original_path, raw_path)
         # 万相不输出可靠透明通道，再次使用百度智能抠图生成透明 PNG。
         rgba = await baidu_segment(raw_path, None, "rgba")
@@ -301,9 +325,14 @@ async def make_emoji(request: EmojiRequest):
             transparent = remove_white_matte(rgba)
         # 不再进行九宫格颜色校正；该步骤会造成明显矩形色块。
         save_png(match_color_intensity(transparent, cutout_image), output_path)
+        logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))
     except asyncio.TimeoutError as exc:
+        background_task.cancel()
+        await asyncio.gather(background_task, return_exceptions=True)
         raise HTTPException(504, "Emoji 生成超过 60 秒") from exc
     except Exception as exc:
+        background_task.cancel()
+        await asyncio.gather(background_task, return_exceptions=True)
         message = provider_error_message(exc)
         lower = message.lower()
         if "429" in lower or "rate" in lower or "thrott" in lower:
@@ -315,6 +344,12 @@ async def make_emoji(request: EmojiRequest):
         else:
             detail = f"风格化生成失败：{message[:180]}"
         raise HTTPException(502, detail) from exc
+    try:
+        _, cache_hit = await background_task
+        logger.info("background prepared image_id=%s object_id=%s cache_hit=%s elapsed_ms=%d", request.imageId, request.objectId, cache_hit, round((time.perf_counter()-background_started)*1000))
+    except Exception:
+        # 预生成失败不影响 Emoji 输出；合成阶段会沿用原来的错误处理并再次尝试。
+        logger.warning("background pre-generation failed image_id=%s object_id=%s", request.imageId, request.objectId, exc_info=True)
     return {"emojiUrl": file_url(output_path), "elapsedMs": round((time.perf_counter()-started)*1000)}
 
 
@@ -323,9 +358,8 @@ async def compose(request: CompositionRequest):
     started = time.perf_counter(); folder = item_dir(request.imageId)
     original_path = folder / "original.png"
     mask = Image.open(folder / f"mask_{request.objectId}.png").convert("L")
-    repaired_path = folder / f"repaired_{request.objectId}.png"
     try:
-        await repair_background_with_retry(original_path, list(bbox_from_mask(mask)), repaired_path)
+        repaired_path, cache_hit = await ensure_background_cache(folder, request.objectId, original_path)
     except asyncio.TimeoutError as exc:
         raise HTTPException(504, "背景修复超过 60 秒；透明 Emoji 仍可下载") from exc
     except Exception as exc:
@@ -339,6 +373,7 @@ async def compose(request: CompositionRequest):
     emoji = harmonize_emoji(Image.open(emoji_path), Image.open(original_path), mask)
     result = composite_emoji(repaired, emoji, bbox_from_mask(mask), add_shadow=False, target_mask=mask)
     result_path = folder / f"result_{request.objectId}_{uuid.uuid4().hex[:6]}.png"; save_png(result, result_path)
+    logger.info("composition image_id=%s object_id=%s background_cache_hit=%s elapsed_ms=%d", request.imageId, request.objectId, cache_hit, round((time.perf_counter()-started)*1000))
     return {"resultUrl": file_url(result_path), "repairedUrl": file_url(repaired_path), "elapsedMs": round((time.perf_counter()-started)*1000)}
 
 
@@ -355,10 +390,14 @@ async def compose_batch(request: BatchCompositionRequest):
             raise HTTPException(404, "主体或 Emoji 文件不存在")
         mask = Image.open(mask_path).convert("L")
         input_path = folder / f"batch_input_{run_id}_{index}.png"
-        repaired_path = folder / f"batch_repaired_{run_id}_{index}.png"
         save_png(current.convert("RGB"), input_path)
         try:
-            await repair_background_with_retry(input_path, list(bbox_from_mask(mask)), repaired_path)
+            if index == 0:
+                repaired_path, cache_hit = await ensure_background_cache(folder, item.objectId, input_path)
+            else:
+                repaired_path = folder / f"batch_repaired_{run_id}_{index}.png"
+                await repair_background_with_retry(input_path, list(bbox_from_mask(mask)), repaired_path)
+                cache_hit = False
         except asyncio.TimeoutError as exc:
             raise HTTPException(504, "多主体背景修复超时") from exc
         except Exception as exc:
@@ -366,6 +405,7 @@ async def compose_batch(request: BatchCompositionRequest):
         repaired = apply_repair_inside_mask(current, Image.open(repaired_path), mask)
         emoji = harmonize_emoji(Image.open(emoji_path), Image.open(folder / "original.png"), mask)
         current = composite_emoji(repaired, emoji, bbox_from_mask(mask), add_shadow=False, target_mask=mask)
+        logger.info("batch composition image_id=%s object_id=%s index=%d background_cache_hit=%s", request.imageId, item.objectId, index, cache_hit)
         input_path.unlink(missing_ok=True)
     result_path = folder / f"result_batch_{run_id}.png"
     save_png(current, result_path)
