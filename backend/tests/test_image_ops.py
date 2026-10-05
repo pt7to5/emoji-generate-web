@@ -2,7 +2,7 @@ import asyncio
 
 from PIL import Image, ImageDraw
 
-from app.image_ops import apply_repair_inside_mask, bbox_from_mask, bbox_from_strokes, complete_subject_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, expand_detection_box, expand_mask, fill_enclosed_holes, filter_candidates, is_complete_subject, mask_needs_completion, match_color_intensity, preserve_color_layout, remove_white_matte
+from app.image_ops import apply_repair_inside_mask, bbox_from_mask, bbox_from_strokes, complete_subject_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, emoji_style_difference, expand_detection_box, expand_mask, fill_enclosed_holes, filter_candidates, is_complete_subject, mask_needs_completion, match_color_intensity, preserve_color_layout, remove_white_matte
 from app import main
 
 
@@ -188,10 +188,14 @@ def test_emoji_style_check_rejects_source_copy_and_accepts_visible_rendering_cha
     source = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
     ImageDraw.Draw(source).ellipse((8, 8, 72, 72), fill=(150, 90, 50, 255))
     copied = source.copy()
+    lightly_adjusted = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
+    ImageDraw.Draw(lightly_adjusted).ellipse((8, 8, 72, 72), fill=(160, 100, 60, 255))
     stylized = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
     ImageDraw.Draw(stylized).ellipse((8, 8, 72, 72), fill=(185, 120, 75, 255))
     assert not emoji_is_visibly_stylized(copied, source)
+    assert not emoji_is_visibly_stylized(lightly_adjusted, source)
     assert emoji_is_visibly_stylized(stylized, source)
+    assert emoji_style_difference(stylized, source) > emoji_style_difference(lightly_adjusted, source)
 
 
 def test_color_intensity_reduces_only_excess_brightness_and_saturation():

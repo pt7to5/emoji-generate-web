@@ -282,14 +282,14 @@ def emoji_matches_source(emoji: Image.Image, source: Image.Image) -> bool:
     return float(np.abs(emoji_mean - source_mean).mean()) < 82
 
 
-def emoji_is_visibly_stylized(emoji: Image.Image, source: Image.Image) -> bool:
-    """拦截直接复制原照片或只做极轻微调色的伪风格化结果。"""
+def emoji_style_difference(emoji: Image.Image, source: Image.Image) -> float:
+    """返回归一化主体区域的平均视觉差异，用于候选排序而非单独决定成败。"""
     emoji = emoji.convert("RGBA")
     source = source.convert("RGBA")
     emoji_box = emoji.getchannel("A").getbbox()
     source_box = source.getchannel("A").getbbox()
     if not emoji_box or not source_box:
-        return False
+        return 0.0
     size = (96, 96)
     emoji_crop = emoji.crop(emoji_box).resize(size, Image.Resampling.LANCZOS)
     source_crop = source.crop(source_box).resize(size, Image.Resampling.LANCZOS)
@@ -297,9 +297,16 @@ def emoji_is_visibly_stylized(emoji: Image.Image, source: Image.Image) -> bool:
     source_array = np.asarray(source_crop, dtype=np.float32)
     common = (emoji_array[..., 3] > 64) & (source_array[..., 3] > 64)
     if common.sum() < 96:
-        return False
+        return 0.0
     pixel_difference = np.abs(emoji_array[..., :3] - source_array[..., :3])[common]
-    return float(pixel_difference.mean()) >= 12
+    return float(pixel_difference.mean())
+
+
+def emoji_is_visibly_stylized(emoji: Image.Image, source: Image.Image) -> bool:
+    """识别过于接近原图的结果，用于触发纠偏；最终仍以结构和实体一致性为硬门槛。"""
+    # 轻微调色或磨皮通常仍低于该差异；提高门槛，确保结果具有肉眼可见的
+    # Emoji 重绘效果，同时由 emoji_matches_source 单独约束轮廓与配色漂移。
+    return emoji_style_difference(emoji, source) >= 18
 
 
 def match_color_intensity(emoji: Image.Image, source: Image.Image) -> Image.Image:

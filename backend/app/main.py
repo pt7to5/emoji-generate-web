@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image
 from .config import BAIDU_PROCESS_API_KEY, BAIDU_PROCESS_SECRET_KEY, CORS_ORIGINS, DASHSCOPE_API_KEY, DATA_DIR, MAX_IMAGE_SIDE, MAX_UPLOAD_BYTES, PUBLIC_BASE_URL
-from .image_ops import apply_repair_inside_mask, bbox_from_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, expand_mask, filter_candidates, is_complete_subject, mask_from_image, match_color_intensity, normalize_image, remove_white_matte, save_png
+from .image_ops import apply_repair_inside_mask, bbox_from_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, emoji_style_difference, expand_mask, filter_candidates, is_complete_subject, mask_from_image, match_color_intensity, normalize_image, remove_white_matte, save_png
 from .providers_domestic import audit_emoji_consistency, baidu_segment, detect_objects_hybrid, generate_emoji_domestic, repair_background_domestic
 from .local_segmentation import segment_from_detection_box, segment_from_guided_strokes, segment_from_positive_strokes
 
@@ -73,11 +73,11 @@ async def repair_background_with_retry(input_path: Path, bbox: list[int], output
     raise last_error
 
 
-async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False) -> None:
+async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False, correction: str = "") -> None:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            await asyncio.wait_for(generate_emoji_domestic(cutout_path, original_path, output_path, strict=strict), timeout=180)
+            await asyncio.wait_for(generate_emoji_domestic(cutout_path, original_path, output_path, strict=strict, correction=correction), timeout=180)
             return
         except Exception as exc:
             last_error = exc
@@ -332,19 +332,58 @@ async def make_emoji(request: EmojiRequest):
         rgba = await baidu_segment(raw_path, None, "rgba")
         transparent = remove_white_matte(rgba)
         audit_path = folder / f"audit_{request.objectId}.png"; save_png(transparent, audit_path)
-        semantic_ok, semantic_reason = await audit_emoji_consistency(cutout_path, audit_path)
-        if not emoji_matches_source(transparent, cutout_image) or not emoji_is_visibly_stylized(transparent, cutout_image) or not semantic_ok:
-            await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True)
+        semantic_ok, semantic_reason, style_class = await audit_emoji_consistency(cutout_path, audit_path)
+        structure_ok = emoji_matches_source(transparent, cutout_image)
+        style_ok = style_class == "3D_EMOJI" and emoji_is_visibly_stylized(transparent, cutout_image)
+        if not structure_ok or not style_ok or not semantic_ok:
+            first_candidate = transparent.copy()
+            first_structure_ok, first_semantic_ok, first_style_ok = structure_ok, semantic_ok, style_ok
+            first_style_score = emoji_style_difference(first_candidate, cutout_image)
+            first_path = folder / f"audit_{request.objectId}_first.png"
+            save_png(transparent, first_path)
+            corrections: list[str] = []
+            if not structure_ok:
+                corrections.append("完整保留原主体外轮廓、长宽比例和所有主要组成部分，不能缺边、扩大或改变形状")
+            if not style_ok:
+                if style_class == "FLAT_CARTOON":
+                    corrections.append("上一版是二维漫画风；彻底移除描边、勾线、赛璐璐阴影和平面色块，严格改为参考图3至图5的苹果系统圆润半立体 Emoji 材质")
+                elif style_class == "PHOTOREALISTIC":
+                    corrections.append("上一版仍过于写实；显著增强圆润半立体 Emoji 重绘效果并概括摄影纹理")
+                else:
+                    corrections.append("严格使用参考图3至图5的苹果系统圆润半立体 Emoji 风格，无描边、连续柔和渐变、自然高光和轻微环境遮蔽")
+            if not semantic_ok:
+                corrections.append(f"消除实体组成错误：{semantic_reason or '不得新增或遗漏任何主要实体'}")
+            logger.info(
+                "emoji first candidate rejected image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
+                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}: {semantic_reason}",
+            )
+            await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections))
             rgba = await baidu_segment(raw_path, None, "rgba")
             transparent = remove_white_matte(rgba)
             save_png(transparent, audit_path)
-            semantic_ok, semantic_reason = await audit_emoji_consistency(cutout_path, audit_path)
-            if not emoji_matches_source(transparent, cutout_image):
+            semantic_ok, semantic_reason, style_class = await audit_emoji_consistency(cutout_path, audit_path)
+            structure_ok = emoji_matches_source(transparent, cutout_image)
+            style_ok = style_class == "3D_EMOJI" and emoji_is_visibly_stylized(transparent, cutout_image)
+            retry_style_score = emoji_style_difference(transparent, cutout_image)
+            logger.info(
+                "emoji correction candidate image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
+                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}: {semantic_reason}",
+            )
+            retry_critical_ok = structure_ok and semantic_ok and style_ok
+            first_critical_ok = first_structure_ok and first_semantic_ok and first_style_ok
+            if first_critical_ok and (not retry_critical_ok or first_style_score > retry_style_score):
+                transparent = first_candidate
+                structure_ok, semantic_ok, style_ok = first_structure_ok, first_semantic_ok, first_style_ok
+                logger.info(
+                    "emoji selected first candidate image_id=%s object_id=%s first_style_score=%.2f retry_style_score=%.2f",
+                    request.imageId, request.objectId, first_style_score, retry_style_score,
+                )
+            if not structure_ok:
                 raise RuntimeError("生成结果未完整保留原主体结构，请重新生成")
-            if not emoji_is_visibly_stylized(transparent, cutout_image):
-                raise RuntimeError("生成结果风格化程度不足，请重新生成")
             if not semantic_ok:
                 raise RuntimeError(f"生成结果与原主体不一致：{semantic_reason or '新增或缺少了实体'}")
+            if not style_ok:
+                raise RuntimeError(f"生成结果不是苹果系统 Emoji 风格：{style_class}")
         # 不再进行九宫格颜色校正；该步骤会造成明显矩形色块。
         save_png(match_color_intensity(transparent, cutout_image), output_path)
         logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))

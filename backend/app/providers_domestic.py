@@ -26,20 +26,27 @@ BAIDU_SUBJECT_DETECT_URL = "https://aip.baidubce.com/rest/2.0/image-classify/v1/
 BAIDU_MULTI_OBJECT_DETECT_URL = "https://aip.baidubce.com/rest/2.0/image-classify/v1/multi_object_detect"
 BAIDU_SEGMENT_URL = "https://aip.baidubce.com/rest/2.0/image-process/v1/segment"
 DASHSCOPE_IMAGE_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+STYLE_REFERENCE_PATHS = tuple((Path(__file__).parent / "assets" / name) for name in (
+    "emoji_style_drinks.jpg",
+    "emoji_style_cakes.jpg",
+    "emoji_style_dessert.jpg",
+))
 
-EMOJI_PROMPT = """图1是唯一需要转换的主体，只能使用图1透明区域内可见的内容。图2是已经去除所有物体语义的低频光线图，只能参考它的整体明暗分布、色温、主光方向和环境色，严禁从图2生成任何物体、形状、场景或陪衬主体。
+EMOJI_PROMPT = """图1是唯一需要转换的主体，只能使用图1透明区域内可见的内容。图2是已经去除所有物体语义的低频光线图，只能参考它的整体明暗分布、色温、主光方向和环境色，严禁从图2生成任何物体、形状、场景或陪衬主体。图3、图4、图5仅是苹果系统 Emoji 风格参考，只能参考它们的圆润半立体材质、连续柔和渐变、自然高光、轻微内阴影和环境遮蔽；绝对不能复制其中的杯子、杯垫、盘子、蛋糕、花朵、蜡烛、五官或任何实体。
 先逐项复刻图1：主体类别、原图中可见的外轮廓、姿态、视角、长宽比例、组成部件、数量、已有装饰、分层结构和每种颜色的位置必须一致。不得改成另一种动物、食物或通用卡通形象，不得新增、删除、合并或放大任何可见结构。
 图1透明区域内出现的所有物体共同组成一个不可拆分的组合主体。盘子、托盘、杯子、花盆、包装、底座、支架以及主体承载物都必须保留并一起风格化；例如“蛋糕放在盘子上”必须输出完整的蛋糕和完整的盘子，不能只输出蛋糕。各组成部分的相对位置、遮挡关系和尺寸比例必须与图1一致。
 严格保持图1已有的遮挡边界：如果主体被手、餐具、容器或其他前景物体挡住，只转换图1中实际可见的部分，不推测、不补画、不扩展被遮挡或画面外的部分。输出轮廓必须与图1透明区域的可见轮廓对应，以便原位置替换。
-在主体身份和几何结构不变的前提下进行清晰可见的高品质 Emoji 化：将细碎摄影纹理简化为干净、柔和、圆润的表面，建立明确但克制的立体体积、柔和方向光、自然高光、渐进明暗和轻微环境遮蔽。效果应像精致移动端 Emoji，而不是扁平插画，也不能变成厚重塑料玩具。
-结果必须能被一眼识别为经过 Emoji 风格化，而不是原照片抠图或仅做亮度、饱和度调整，同时继续保持原有结构、轮廓和颜色关系。
+在主体身份和几何结构不变的前提下进行强度明确的高品质 Emoji 化。整体视觉应约为“七成移动端 Emoji 渲染、三成原物摄影特征”：保留用于辨认原主体的结构与配色，但必须主动去除照片感，不能只是抠图、磨皮、提亮或调色。
+把照片中的细碎纹理、噪点、纤维、细小褶皱和零散高频细节概括成干净、柔和、圆润的连续曲面；强化清晰的立体体积、适度饱满的造型、柔和方向光、自然高光、渐进明暗、轻微内阴影和环境遮蔽。边缘只能由体积和光影形成，禁止任何深色描边、勾线或漫画轮廓。缩小到手机 Emoji 尺寸时仍应有清楚的图标识别度。效果必须与图3至图5的苹果系统 Emoji 材质语言一致，而不是写实照片、扁平插画、漫画贴纸或厚重塑料玩具。
+对于花束、植物、毛绒物和复杂甜品，可以简化单片花瓣、叶脉、绒毛、奶油纹路等微观细节，但必须保留主要花朵/叶簇/装饰簇、包装层次、主体数量、相对位置和整体外轮廓。简化纹理不等于删除组成物。
+结果必须一眼就能识别为经过明显 Emoji 风格化，同时继续保持原有主体身份、主要结构、轮廓、颜色分区和组合关系。
 颜色强度必须服从图1：不得自动提亮，不得提高饱和度，不得把低饱和颜色改成鲜艳色或荧光色。白色、奶油色、浅灰色等低饱和区域必须保持低饱和；绿色、黄色、红色等彩色区域的明度与浓度也要接近图1。
 光线方向、色温、亮暗和阴影方向综合继承图1主体自身表现与图2的低频光线布局，使生成物能自然融入原照片。
 输出要求：完整单个主体，尺寸比例与图1一致，原视角，居中，纯白背景，四周留出少量空白，不裁切。
 生成前先核对图1已有组件清单，输出中每一个实体都必须能在图1透明区域内找到对应物。绝对禁止凭空增加盘子、托盘、底座、支架、容器、包装、装饰物或其他实体；只有图1原本存在时才允许保留并风格化。
 严禁：扁平矢量插画、色带、等高线式分层、几何色块、硬边渐变、明显分区接缝、低多边形、厚重3D玩具、塑料高光、镜面反射、擅自拟人化、添加新五官或装饰、改变主体类别、改变颜色、文字、水印、边框和场景。"""
 
-NEGATIVE_PROMPT = "凭空新增盘子，凭空新增托盘，凭空新增底座，凭空新增支架，凭空新增容器，凭空新增包装，凭空新增装饰，主体身份改变，结构缺失，遗漏原有盘子，遗漏原有托盘，遗漏原有底座，遗漏原有容器，拆散组合主体，补画被遮挡部位，扩展到原可见轮廓之外，新增结构，部件数量改变，比例改变，主体放大，姿态改变，颜色改变，通用卡通形象，独立贴纸，自动提亮，提高饱和度，荧光色，糖果色，扁平矢量插画，几何色块，色带，等高线分层，分区接缝，硬边渐变，低多边形，复杂背景，无关主体，文字，水印，边框，裁切，错误透视，新增眼睛，新增嘴巴，新增四肢，过度拟人，线稿，硬阴影，过曝，镜面反射，塑料玩具质感，厚重3D模型，悬浮"
+NEGATIVE_PROMPT = "凭空新增盘子，凭空新增托盘，凭空新增底座，凭空新增支架，凭空新增容器，凭空新增包装，凭空新增装饰，复制参考图实体，主体身份改变，结构缺失，遗漏原有盘子，遗漏原有托盘，遗漏原有底座，遗漏原有容器，拆散组合主体，补画被遮挡部位，扩展到原可见轮廓之外，新增结构，部件数量改变，比例改变，主体放大，姿态改变，颜色改变，通用卡通形象，独立贴纸，自动提亮，提高饱和度，荧光色，糖果色，二维漫画，漫画贴纸，赛璐璐上色，粗描边，深色轮廓线，棕色勾线，黑色勾线，扁平矢量插画，平面色块，几何色块，色带，等高线分层，分区接缝，硬边渐变，低多边形，复杂背景，无关主体，文字，水印，边框，裁切，错误透视，新增眼睛，新增嘴巴，新增四肢，过度拟人，线稿，硬阴影，过曝，镜面反射，塑料玩具质感，厚重3D模型，悬浮"
 
 
 def _require_keys() -> None:
@@ -226,18 +233,20 @@ bbox 使用 0 到 999 的归一化坐标。列出所有明显主体，最多 8 �
     return detections
 
 
-async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[bool, str]:
-    """语义审核生成图是否凭空新增或删除了原选区中的实体组件。"""
+async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[bool, str, str]:
+    """分别审核实体一致性和苹果系统 Emoji 风格。"""
     _require_keys()
-    prompt = """图1是识别选区内的原主体，图2是它的 Emoji 风格化结果。审核实体组成是否一致。
+    prompt = """图1是识别选区内的原主体，图2是生成结果，图3至图5是苹果系统 Emoji 风格参考。请分别审核实体组成与视觉风格。
 允许：材质简化、圆润化、柔和光影，以及杯内原有饮品、冰块、水果、吸管和装饰的风格化。
 不允许：图2出现图1没有的盘子、托盘、底座、支架、容器、包装、食物、装饰、文字或任何新实体；也不允许删除图1已有的主要实体或改变数量。
-忽略纯白/透明背景、阴影和细微纹理差异。只返回 JSON：{"pass":true或false,"added":["新增项"],"missing":["缺失项"],"reason":"简短原因"}。只要 added 或 missing 中存在主要实体，pass 必须为 false。"""
+风格分类只能是：3D_EMOJI（像图3至图5，圆润半立体、无描边、连续柔和渐变）、FLAT_CARTOON（漫画、粗描边、赛璐璐、平面色块或贴纸插画）、PHOTOREALISTIC（仍接近照片）或 INVALID。
+忽略纯白/透明背景、阴影和细微纹理差异。只返回 JSON：{"pass":true或false,"style":"3D_EMOJI或FLAT_CARTOON或PHOTOREALISTIC或INVALID","added":["新增项"],"missing":["缺失项"],"reason":"简短原因"}。只要 added 或 missing 中存在主要实体，pass 必须为 false。"""
     payload = {
         "model": "qwen3.6-plus",
         "input": {"messages": [{"role": "user", "content": [
             {"image": _data_uri(source_path, force_white=True)},
             {"image": _data_uri(emoji_path, force_white=True)},
+            *({"image": _data_uri(path)} for path in STYLE_REFERENCE_PATHS if path.exists()),
             {"text": prompt},
         ]}]},
         "parameters": {"result_format": "message", "vl_high_resolution_images": True, "temperature": 0, "enable_thinking": False},
@@ -253,11 +262,11 @@ async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[
     text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
-        return False, "一致性审核未返回有效结果"
+        return False, "一致性审核未返回有效结果", "INVALID"
     try:
         result = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return False, "一致性审核结果无法解析"
+        return False, "一致性审核结果无法解析", "INVALID"
     added = result.get("added") if isinstance(result.get("added"), list) else []
     missing = result.get("missing") if isinstance(result.get("missing"), list) else []
     passed = result.get("pass") is True and not added and not missing
@@ -266,7 +275,10 @@ async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[
         reason = "新增了：" + "、".join(map(str, added))
     elif missing:
         reason = "缺少了：" + "、".join(map(str, missing))
-    return passed, reason
+    style = str(result.get("style") or "INVALID").upper()
+    if style not in {"3D_EMOJI", "FLAT_CARTOON", "PHOTOREALISTIC", "INVALID"}:
+        style = "INVALID"
+    return passed, reason, style
 
 
 async def detect_objects_hybrid(image_path: Path) -> list[dict[str, Any]]:
@@ -323,10 +335,17 @@ async def _dashscope_generate(model: str, content: list[dict[str, str]], paramet
         return image_response.content
 
 
-async def generate_emoji_domestic(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False) -> None:
-    retry_note = "\n这是纠偏重试：上一版与原主体不够相似或遗漏了可见组成部分。请降低风格化强度，严格逐项复刻图1的可见轮廓、所有可见承载物、盘子、托盘、底座、容器、结构、已有五官和颜色，只改变表面渲染质感。任何可见组成部分都不能删除，也不要补画被遮挡或画面外的部分。" if strict else ""
+async def generate_emoji_domestic(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False, correction: str = "") -> None:
+    retry_note = "\n这是纠偏重试：上一版未同时满足结构一致和明显 Emoji 化。保持较强的移动端半立体 Emoji 风格，不得退回写实照片或只改变表面色调；同时严格逐项复刻图1的可见外轮廓、所有可见承载物、盘子、托盘、底座、容器、主要结构、已有五官和颜色分区。可以进一步概括微小摄影纹理，但任何主要组成部分都不能删除，也不要补画被遮挡或画面外的部分。" if strict else ""
+    if correction:
+        retry_note += "\n本次必须重点修正：" + correction[:400]
     # 第二张图降到极低频，只传递整图明暗和色温布局，不携带可识别物体。
-    content = [{"image": _data_uri(cutout_path, force_white=True)}, {"image": _lighting_map_data_uri(original_path)}, {"text": EMOJI_PROMPT + retry_note}]
+    content = [
+        {"image": _data_uri(cutout_path, force_white=True)},
+        {"image": _lighting_map_data_uri(original_path)},
+        *({"image": _data_uri(path)} for path in STYLE_REFERENCE_PATHS if path.exists()),
+        {"text": EMOJI_PROMPT + retry_note},
+    ]
     parameters: dict[str, Any] = {
         "size": "1K" if EMOJI_GENERATION_MODEL.startswith("wan") else "1024*1024",
         "n": EMOJI_GENERATION_CANDIDATES,
