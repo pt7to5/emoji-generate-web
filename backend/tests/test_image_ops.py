@@ -2,7 +2,7 @@ import asyncio
 
 from PIL import Image, ImageDraw
 
-from app.image_ops import apply_repair_inside_mask, bbox_from_mask, bbox_from_strokes, complete_subject_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_matches_source, expand_detection_box, expand_mask, fill_enclosed_holes, filter_candidates, is_complete_subject, mask_needs_completion, match_color_intensity, preserve_color_layout, remove_white_matte
+from app.image_ops import apply_repair_inside_mask, bbox_from_mask, bbox_from_strokes, complete_subject_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, expand_detection_box, expand_mask, fill_enclosed_holes, filter_candidates, is_complete_subject, mask_needs_completion, match_color_intensity, preserve_color_layout, remove_white_matte
 from app import main
 
 
@@ -167,6 +167,33 @@ def test_emoji_fidelity_rejects_large_shape_or_color_drift():
     assert not emoji_matches_source(wrong, source)
 
 
+def test_emoji_fidelity_rejects_similar_color_with_unrelated_silhouette():
+    source = Image.new("RGBA", (120, 120), (0, 0, 0, 0))
+    ImageDraw.Draw(source).polygon([(60, 5), (112, 58), (60, 114), (8, 58)], fill=(90, 150, 200, 255))
+    unrelated = Image.new("RGBA", (120, 120), (0, 0, 0, 0))
+    ImageDraw.Draw(unrelated).ellipse((8, 8, 112, 112), outline=(90, 150, 200, 255), width=10)
+
+    assert not emoji_matches_source(unrelated, source)
+
+
+def test_emoji_fidelity_rejects_extra_large_subject_outside_source_shape():
+    source = Image.new("RGBA", (120, 120), (0, 0, 0, 0))
+    ImageDraw.Draw(source).ellipse((18, 20, 68, 100), fill=(100, 150, 90, 255))
+    with_extra_subject = source.copy()
+    ImageDraw.Draw(with_extra_subject).ellipse((72, 16, 116, 92), fill=(100, 150, 90, 255))
+    assert not emoji_matches_source(with_extra_subject, source)
+
+
+def test_emoji_style_check_rejects_source_copy_and_accepts_visible_rendering_change():
+    source = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
+    ImageDraw.Draw(source).ellipse((8, 8, 72, 72), fill=(150, 90, 50, 255))
+    copied = source.copy()
+    stylized = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
+    ImageDraw.Draw(stylized).ellipse((8, 8, 72, 72), fill=(185, 120, 75, 255))
+    assert not emoji_is_visibly_stylized(copied, source)
+    assert emoji_is_visibly_stylized(stylized, source)
+
+
 def test_color_intensity_reduces_only_excess_brightness_and_saturation():
     source = Image.new("RGBA", (40, 40), (120, 145, 110, 255))
     vivid = Image.new("RGBA", (40, 40), (120, 255, 30, 255))
@@ -227,3 +254,29 @@ def test_batch_composition_replays_from_original_when_one_edit_is_removed(tmp_pa
     undo_image = Image.open(folder / undo_result["resultUrl"]).convert("RGB")
     assert undo_image.getpixel((50, 60)) == (255, 255, 255)
     assert undo_image.getpixel((150, 60))[2] > 200
+
+
+def test_background_repair_cache_is_reused_for_unchanged_mask(tmp_path, monkeypatch):
+    folder = tmp_path / "image-1"
+    folder.mkdir()
+    original_path = folder / "original.png"
+    Image.new("RGB", (120, 80), "white").save(original_path)
+    mask = Image.new("L", (120, 80), 0)
+    ImageDraw.Draw(mask).rectangle((20, 10, 90, 70), fill=255)
+    mask.save(folder / "mask_01.png")
+    calls = 0
+
+    async def repair_once(input_path, _box, output_path):
+        nonlocal calls
+        calls += 1
+        Image.open(input_path).save(output_path)
+
+    monkeypatch.setattr(main, "repair_background_with_retry", repair_once)
+
+    first_path, first_hit = asyncio.run(main.ensure_background_cache(folder, "01", original_path))
+    second_path, second_hit = asyncio.run(main.ensure_background_cache(folder, "01", original_path))
+
+    assert first_path == second_path
+    assert not first_hit
+    assert second_hit
+    assert calls == 1

@@ -61,6 +61,14 @@ export async function editMask(imageId: string, objectId: string, points: [numbe
   }))
 }
 
+export async function preciseEditMask(imageId: string, objectId: string, points: [number, number, number][], radius: number, mode: 'add' | 'remove') {
+  return json<MaskCandidate>(await fetch(apiUrl(`/api/images/${imageId}/masks/${objectId}/precise-edit`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ points, radius, mode }),
+  }))
+}
+
 export async function generateEmoji(imageId: string, objectId: string) {
   return json<{ emojiUrl: string; elapsedMs: number }>(await fetch(apiUrl('/api/emojis'), {
     method: 'POST',

@@ -125,9 +125,10 @@ def is_complete_subject(mask: Image.Image, size: tuple[int, int]) -> bool:
     box_width = bbox[2] - bbox[0]; box_height = bbox[3] - bbox[1]
     touches = sum((bbox[0] <= width * .015, bbox[1] <= height * .015, bbox[2] >= width * .985, bbox[3] >= height * .985))
     box_ratio = box_width * box_height / max(1, width * height)
-    if touches >= 2 and box_ratio > .30:
-        return False
-    if box_width > width * .88 and box_height > height * .45:
+    binary = mask.resize(size, Image.Resampling.NEAREST).convert("L").point(lambda p: 255 if p > 64 else 0)
+    mask_ratio = binary.histogram()[255] / max(1, width * height)
+    # 近景盘子、花束可能自然贴住左右两边；只有几乎覆盖整张图时才按环境区域过滤。
+    if touches >= 3 and box_ratio > .50 and mask_ratio > .50:
         return False
     return True
 
@@ -243,9 +244,62 @@ def emoji_matches_source(emoji: Image.Image, source: Image.Image) -> bool:
     source_ratio = (source_box[2] - source_box[0]) / max(1, source_box[3] - source_box[1])
     if max(emoji_ratio, source_ratio) / max(.01, min(emoji_ratio, source_ratio)) > 1.9:
         return False
+    # 将透明轮廓归一化后比较，拦截“颜色相近但主体形状完全变化”的结果。
+    emoji_shape = emoji.getchannel("A").crop(emoji_box).resize((96, 96), Image.Resampling.NEAREST)
+    source_shape = source.getchannel("A").crop(source_box).resize((96, 96), Image.Resampling.NEAREST)
+    emoji_binary = np.asarray(emoji_shape) > 64
+    source_binary = np.asarray(source_shape) > 64
+    def major_components(binary: np.ndarray) -> int:
+        seen = np.zeros(binary.shape, dtype=bool)
+        count = 0
+        minimum_area = max(24, round(binary.size * .008))
+        height, width = binary.shape
+        for start_y, start_x in zip(*np.where(binary & ~seen)):
+            if seen[start_y, start_x]:
+                continue
+            stack = [(int(start_x), int(start_y))]
+            seen[start_y, start_x] = True
+            area = 0
+            while stack:
+                x, y = stack.pop(); area += 1
+                for nx, ny in ((x-1,y),(x+1,y),(x,y-1),(x,y+1)):
+                    if 0 <= nx < width and 0 <= ny < height and binary[ny,nx] and not seen[ny,nx]:
+                        seen[ny,nx] = True; stack.append((nx,ny))
+            if area >= minimum_area:
+                count += 1
+        return count
+    if major_components(emoji_binary) > major_components(source_binary):
+        return False
+    shape_intersection = np.logical_and(emoji_binary, source_binary).sum()
+    shape_union = np.logical_or(emoji_binary, source_binary).sum()
+    if shape_intersection / max(1, shape_union) < .52:
+        return False
+    fill_ratio = emoji_binary.mean() / max(.001, source_binary.mean())
+    if not .68 <= fill_ratio <= 1.42:
+        return False
     emoji_mean = np.array(ImageStat.Stat(emoji.convert("RGB"), mask=emoji.getchannel("A")).mean[:3])
     source_mean = np.array(ImageStat.Stat(source.convert("RGB"), mask=source.getchannel("A")).mean[:3])
     return float(np.abs(emoji_mean - source_mean).mean()) < 82
+
+
+def emoji_is_visibly_stylized(emoji: Image.Image, source: Image.Image) -> bool:
+    """拦截直接复制原照片或只做极轻微调色的伪风格化结果。"""
+    emoji = emoji.convert("RGBA")
+    source = source.convert("RGBA")
+    emoji_box = emoji.getchannel("A").getbbox()
+    source_box = source.getchannel("A").getbbox()
+    if not emoji_box or not source_box:
+        return False
+    size = (96, 96)
+    emoji_crop = emoji.crop(emoji_box).resize(size, Image.Resampling.LANCZOS)
+    source_crop = source.crop(source_box).resize(size, Image.Resampling.LANCZOS)
+    emoji_array = np.asarray(emoji_crop, dtype=np.float32)
+    source_array = np.asarray(source_crop, dtype=np.float32)
+    common = (emoji_array[..., 3] > 64) & (source_array[..., 3] > 64)
+    if common.sum() < 96:
+        return False
+    pixel_difference = np.abs(emoji_array[..., :3] - source_array[..., :3])[common]
+    return float(pixel_difference.mean()) >= 12
 
 
 def match_color_intensity(emoji: Image.Image, source: Image.Image) -> Image.Image:

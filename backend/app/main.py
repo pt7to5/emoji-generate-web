@@ -11,9 +11,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image
 from .config import BAIDU_PROCESS_API_KEY, BAIDU_PROCESS_SECRET_KEY, CORS_ORIGINS, DASHSCOPE_API_KEY, DATA_DIR, MAX_IMAGE_SIDE, MAX_UPLOAD_BYTES, PUBLIC_BASE_URL
-from .image_ops import apply_repair_inside_mask, bbox_from_mask, complete_subject_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_matches_source, expand_detection_box, expand_mask, filter_candidates, harmonize_emoji, is_complete_subject, mask_from_image, mask_needs_completion, match_color_intensity, normalize_image, remove_white_matte, save_png
-from .providers_domestic import baidu_segment, detect_objects_hybrid, generate_emoji_domestic, repair_background_domestic
-from .local_segmentation import segment_from_positive_strokes
+from .image_ops import apply_repair_inside_mask, bbox_from_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, expand_mask, filter_candidates, is_complete_subject, mask_from_image, match_color_intensity, normalize_image, remove_white_matte, save_png
+from .providers_domestic import audit_emoji_consistency, baidu_segment, detect_objects_hybrid, generate_emoji_domestic, repair_background_domestic
+from .local_segmentation import segment_from_detection_box, segment_from_guided_strokes, segment_from_positive_strokes
 
 app = FastAPI(title="Object Emoji MVP")
 logger = logging.getLogger("object-emoji")
@@ -34,6 +34,10 @@ class MaskEditRequest(BaseModel):
     points: list[list[float]] = Field(min_length=1, max_length=4000)
     radius: float = Field(default=18, ge=2, le=160)
     mode: str = Field(pattern="^(add|remove)$")
+
+
+class PreciseMaskEditRequest(MaskEditRequest):
+    pass
 
 
 class EmojiRequest(BaseModel):
@@ -185,39 +189,15 @@ async def detect_image(image_id: str):
     scores = []
     try:
         detections = await detect_objects_hybrid(original_path)
-        for detection_index, detection in enumerate(detections):
+        for detection in detections:
             try:
-                segment_box = expand_detection_box(detection["box"], image.size)
-                segmented = await baidu_segment(original_path, segment_box, "mask")
-                primary_mask = mask_from_image(segmented, image.size)
-                supplemental_mask = None
-                if mask_needs_completion(primary_mask, detection["box"]):
-                    x1, y1, x2, y2 = detection["box"]
-                    pad_x = round((x2-x1) * .12); pad_y = round((y2-y1) * .12)
-                    crop_box = (max(0, x1-pad_x), max(0, y1-pad_y), min(image.width, x2+pad_x), min(image.height, y2+pad_y))
-                    crop_path = folder / f"audit_crop_{detection_index:02d}.png"
-                    save_png(image.crop(crop_box), crop_path)
-                    try:
-                        cropped = await baidu_segment(crop_path, None, "mask")
-                        crop_mask = mask_from_image(cropped, (crop_box[2]-crop_box[0], crop_box[3]-crop_box[1]))
-                        supplemental_mask = Image.new("L", image.size, 0); supplemental_mask.paste(crop_mask, crop_box[:2])
-                    except Exception:
-                        supplemental_mask = None
-                    finally:
-                        crop_path.unlink(missing_ok=True)
-                masks.append(complete_subject_mask(primary_mask, supplemental_mask, detection["box"]))
+                masks.append(await asyncio.to_thread(segment_from_detection_box, original_path, detection["box"]))
                 labels.append(detection["label"])
                 scores.append(detection["score"])
             except Exception:
                 continue
         if not masks:
-            try:
-                segmented = await baidu_segment(original_path, None, "mask")
-                masks = [mask_from_image(segmented, image.size)]
-                labels = ["主要主体"]
-                scores = [1.0]
-            except Exception:
-                detection_warning = "自动识别暂时失败，请使用涂抹工具选择主体"
+            detection_warning = "自动识别暂时失败，请使用涂抹工具选择主体"
         masks = [mask for mask in filter_candidates(masks, image.size, limit=8) if is_complete_subject(mask, image.size)]
         if not masks:
             detection_warning = "未找到完整独立主体，请使用涂抹工具选择主体"
@@ -287,15 +267,47 @@ async def edit_object_mask(image_id: str, object_id: str, request: MaskEditReque
     if not mask_path.exists():
         raise HTTPException(404, "主体不存在")
     try:
-        edited = edit_mask_with_brush(Image.open(mask_path), request.points, request.radius, request.mode)
+        current_mask = Image.open(mask_path).convert("L")
+        stroke_points = [[point[0], point[1]] for point in request.points if len(point) >= 2]
+        edited = await asyncio.to_thread(
+            segment_from_guided_strokes,
+            folder / "original.png",
+            current_mask,
+            stroke_points if request.mode == "add" else [],
+            stroke_points if request.mode == "remove" else [],
+            request.radius,
+        )
         bbox_from_mask(edited)
     except Exception as exc:
-        raise HTTPException(422, "蒙版修改失败啦，再试一次吧") from exc
+        logger.exception("smart mask edit failed image_id=%s object_id=%s mode=%s", image_id, object_id, request.mode)
+        raise HTTPException(422, "智能修正没有找到合适边界，请换个位置再画一笔") from exc
     save_png(edited, mask_path)
     preview, _ = cutout(original, edited)
     save_png(preview, folder / f"preview_{object_id}.png")
     payload = object_payload(image_id, object_id)
-    payload["label"] = "手动修正主体"
+    payload["label"] = "智能修正主体"
+    payload["score"] = 1.0
+    return payload
+
+
+@app.post("/api/images/{image_id}/masks/{object_id}/precise-edit")
+async def precise_edit_object_mask(image_id: str, object_id: str, request: PreciseMaskEditRequest):
+    """像素级兜底工具；只在智能修正无法满足用户意图时使用。"""
+    folder = item_dir(image_id)
+    original = Image.open(folder / "original.png").convert("RGB")
+    mask_path = folder / f"mask_{object_id}.png"
+    if not mask_path.exists():
+        raise HTTPException(404, "主体不存在")
+    try:
+        edited = edit_mask_with_brush(Image.open(mask_path), request.points, request.radius, request.mode)
+        bbox_from_mask(edited)
+    except Exception as exc:
+        raise HTTPException(422, "精细画笔修改失败啦，再试一次吧") from exc
+    save_png(edited, mask_path)
+    preview, _ = cutout(original, edited)
+    save_png(preview, folder / f"preview_{object_id}.png")
+    payload = object_payload(image_id, object_id)
+    payload["label"] = "精细修正主体"
     payload["score"] = 1.0
     return payload
 
@@ -319,10 +331,20 @@ async def make_emoji(request: EmojiRequest):
         # 万相不输出可靠透明通道，再次使用百度智能抠图生成透明 PNG。
         rgba = await baidu_segment(raw_path, None, "rgba")
         transparent = remove_white_matte(rgba)
-        if not emoji_matches_source(transparent, cutout_image):
+        audit_path = folder / f"audit_{request.objectId}.png"; save_png(transparent, audit_path)
+        semantic_ok, semantic_reason = await audit_emoji_consistency(cutout_path, audit_path)
+        if not emoji_matches_source(transparent, cutout_image) or not emoji_is_visibly_stylized(transparent, cutout_image) or not semantic_ok:
             await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True)
             rgba = await baidu_segment(raw_path, None, "rgba")
             transparent = remove_white_matte(rgba)
+            save_png(transparent, audit_path)
+            semantic_ok, semantic_reason = await audit_emoji_consistency(cutout_path, audit_path)
+            if not emoji_matches_source(transparent, cutout_image):
+                raise RuntimeError("生成结果未完整保留原主体结构，请重新生成")
+            if not emoji_is_visibly_stylized(transparent, cutout_image):
+                raise RuntimeError("生成结果风格化程度不足，请重新生成")
+            if not semantic_ok:
+                raise RuntimeError(f"生成结果与原主体不一致：{semantic_reason or '新增或缺少了实体'}")
         # 不再进行九宫格颜色校正；该步骤会造成明显矩形色块。
         save_png(match_color_intensity(transparent, cutout_image), output_path)
         logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))
@@ -370,7 +392,7 @@ async def compose(request: CompositionRequest):
         raise HTTPException(404, "Emoji 文件不存在")
     original = Image.open(original_path).convert("RGBA")
     repaired = apply_repair_inside_mask(original, Image.open(repaired_path), mask)
-    emoji = harmonize_emoji(Image.open(emoji_path), Image.open(original_path), mask)
+    emoji = Image.open(emoji_path).convert("RGBA")
     result = composite_emoji(repaired, emoji, bbox_from_mask(mask), add_shadow=False, target_mask=mask)
     result_path = folder / f"result_{request.objectId}_{uuid.uuid4().hex[:6]}.png"; save_png(result, result_path)
     logger.info("composition image_id=%s object_id=%s background_cache_hit=%s elapsed_ms=%d", request.imageId, request.objectId, cache_hit, round((time.perf_counter()-started)*1000))
@@ -403,7 +425,7 @@ async def compose_batch(request: BatchCompositionRequest):
         except Exception as exc:
             raise HTTPException(502, f"多主体背景修复失败：{type(exc).__name__}") from exc
         repaired = apply_repair_inside_mask(current, Image.open(repaired_path), mask)
-        emoji = harmonize_emoji(Image.open(emoji_path), Image.open(folder / "original.png"), mask)
+        emoji = Image.open(emoji_path).convert("RGBA")
         current = composite_emoji(repaired, emoji, bbox_from_mask(mask), add_shadow=False, target_mask=mask)
         logger.info("batch composition image_id=%s object_id=%s index=%d background_cache_hit=%s", request.imageId, item.objectId, index, cache_hit)
         input_path.unlink(missing_ok=True)

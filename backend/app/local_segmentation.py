@@ -155,6 +155,178 @@ def _predict_masks(model, image_path: Path, *, points=None, labels=None, bboxes=
     return [candidate > .5 for candidate in results[0].masks.data.detach().cpu().numpy()]
 
 
+def _box_iou(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> float:
+    intersection = max(0, min(first[2], second[2]) - max(first[0], second[0])) * max(0, min(first[3], second[3]) - max(first[1], second[1]))
+    first_area = max(1, (first[2] - first[0]) * (first[3] - first[1]))
+    second_area = max(1, (second[2] - second[0]) * (second[3] - second[1]))
+    return intersection / max(1, first_area + second_area - intersection)
+
+
+def _internal_completion_points(mask: np.ndarray, box: list[int], limit: int = 6) -> list[list[float]]:
+    """寻找主蒙版内部被挖空的显著区域，例如盘子中的蛋糕。"""
+    height, width = mask.shape
+    x1, y1, x2, y2 = [int(value) for value in box]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width, x2), min(height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return []
+    crop = mask[y1:y2, x1:x2].astype(np.uint8)
+    inverse = 1 - crop
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(inverse, connectivity=8)
+    prompt_area = max(1, crop.size)
+    components: list[tuple[int, int]] = []
+    for label in range(1, count):
+        left = int(stats[label, cv2.CC_STAT_LEFT])
+        top = int(stats[label, cv2.CC_STAT_TOP])
+        component_width = int(stats[label, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        touches_border = left == 0 or top == 0 or left + component_width == crop.shape[1] or top + component_height == crop.shape[0]
+        if not touches_border and area >= max(48, round(prompt_area * .002)):
+            components.append((area, label))
+    points: list[list[float]] = []
+    for _, label in sorted(components, reverse=True)[:limit]:
+        component = (labels == label).astype(np.uint8)
+        distance = cv2.distanceTransform(component, cv2.DIST_L2, 5)
+        y, x = np.unravel_index(int(np.argmax(distance)), distance.shape)
+        points.append([float(x + x1), float(y + y1)])
+    return points
+
+
+def _mask_containment(mask: np.ndarray, box: list[int]) -> float:
+    x1, y1, x2, y2 = [int(value) for value in box]
+    inside = int(mask[max(0, y1):min(mask.shape[0], y2), max(0, x1):min(mask.shape[1], x2)].sum())
+    return inside / max(1, int(mask.sum()))
+
+
+def segment_from_detection_box(image_path: Path, box: list[int]) -> Image.Image:
+    """使用语义模型给出的完整主体框，让 MobileSAM 输出最终蒙版。"""
+    if len(box) != 4 or box[2] <= box[0] or box[3] <= box[1]:
+        raise ValueError("主体框无效")
+    model = _get_model()
+    with Image.open(image_path) as source:
+        image_size = source.size
+        inference_size = image_size
+        inference_path = image_path
+        temporary_path: Path | None = None
+        if max(image_size) > MAX_INFERENCE_SIDE:
+            inference = source.convert("RGB")
+            inference.thumbnail((MAX_INFERENCE_SIDE, MAX_INFERENCE_SIDE), Image.Resampling.LANCZOS)
+            inference_size = inference.size
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+            inference.save(temporary_path, "JPEG", quality=90)
+            inference_path = temporary_path
+
+    scale_x = inference_size[0] / image_size[0]
+    scale_y = inference_size[1] / image_size[1]
+    scaled_box = [
+        max(0, round(box[0] * scale_x)),
+        max(0, round(box[1] * scale_y)),
+        min(inference_size[0] - 1, round(box[2] * scale_x)),
+        min(inference_size[1] - 1, round(box[3] * scale_y)),
+    ]
+    prompt_box = tuple(scaled_box)
+    center = [[(scaled_box[0] + scaled_box[2]) / 2, (scaled_box[1] + scaled_box[3]) / 2]]
+    try:
+        with _model_lock:
+            candidates = _predict_masks(model, inference_path, bboxes=[scaled_box])
+        ranked: list[tuple[float, np.ndarray]] = []
+        prompt_area = max(1, (scaled_box[2] - scaled_box[0]) * (scaled_box[3] - scaled_box[1]))
+        for candidate in candidates:
+            if not _valid_candidate(candidate):
+                continue
+            candidate_box = _mask_bbox(candidate)
+            area = int(candidate.sum())
+            center_bonus = 1.0 if _point_coverage(candidate, center) else 0.0
+            size_ratio = min(area, prompt_area) / max(area, prompt_area)
+            score = center_bonus * 2.0 + _box_iou(candidate_box, prompt_box) + size_ratio
+            ranked.append((score, candidate))
+        if not ranked:
+            raise RuntimeError("本地模型未找到主体")
+        result = _clean_subject_mask(max(ranked, key=lambda item: item[0])[1])
+        # 框提示倾向只返回最大的承载物（例如盘子），其上的蛋糕会成为蒙版内部空洞。
+        # 对这些封闭空洞逐点分割，并且只合并几乎完全位于语义框内部的候选。
+        completion_points = _internal_completion_points(result, scaled_box)
+        for point in completion_points:
+            with _model_lock:
+                additions = _predict_masks(model, inference_path, points=[point], labels=[1])
+            eligible: list[tuple[float, np.ndarray]] = []
+            for addition in additions:
+                if not _valid_candidate(addition) or not _point_coverage(addition, [point]):
+                    continue
+                containment = _mask_containment(addition, scaled_box)
+                overlap = _mask_iou(addition, result)
+                if containment < .94 or overlap > .82:
+                    continue
+                eligible.append((containment - overlap, addition))
+            if eligible:
+                result = np.logical_or(result, max(eligible, key=lambda item: item[0])[1])
+        result = _clean_subject_mask(result)
+        mask = Image.fromarray((result * 255).astype(np.uint8), "L")
+        return mask.resize(image_size, Image.Resampling.NEAREST)
+    finally:
+        if temporary_path:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _mask_anchor_points(mask: Image.Image, limit: int = 8) -> list[list[float]]:
+    """从当前主体内部选取稳定锚点，让修正围绕现有主体而不是重新猜测。"""
+    binary = np.asarray(mask.convert("L")) > 64
+    if not binary.any():
+        return []
+    distance = cv2.distanceTransform(binary.astype(np.uint8), cv2.DIST_L2, 5)
+    height, width = binary.shape
+    anchors: list[list[float]] = []
+    rows = 2
+    columns = max(2, limit // rows)
+    for row in range(rows):
+        for column in range(columns):
+            y1, y2 = row * height // rows, (row + 1) * height // rows
+            x1, x2 = column * width // columns, (column + 1) * width // columns
+            cell = distance[y1:y2, x1:x2]
+            if cell.size and float(cell.max()) > 0:
+                y, x = np.unravel_index(int(np.argmax(cell)), cell.shape)
+                anchors.append([float(x + x1), float(y + y1)])
+    return anchors[:limit]
+
+
+def _mask_iou(first: np.ndarray, second: np.ndarray) -> float:
+    intersection = np.logical_and(first, second).sum()
+    union = np.logical_or(first, second).sum()
+    return float(intersection / max(1, union))
+
+
+def segment_from_guided_strokes(
+    image_path: Path,
+    current_mask: Image.Image,
+    positive_points: list[list[float]],
+    negative_points: list[list[float]],
+    radius: float = 18,
+) -> Image.Image:
+    """使用当前 Mask 与正负提示重新识别主体，不直接涂改 Mask 像素。"""
+    if not positive_points and not negative_points:
+        raise ValueError("智能修正至少需要一笔提示")
+    image_size = current_mask.size
+    result = np.asarray(current_mask.convert("L")) > 64
+
+    # “增加”识别用户新涂到的完整主体，再与原结果合并。不能让新主体覆盖旧主体。
+    if positive_points:
+        addition = segment_from_positive_strokes(image_path, positive_points, radius)
+        addition_array = np.asarray(addition.resize(image_size, Image.Resampling.NEAREST).convert("L")) > 64
+        result = np.logical_or(result, addition_array)
+
+    # “删除”先识别涂抹处代表的完整物体，再从现有组合中扣除。
+    if negative_points:
+        removal = segment_from_positive_strokes(image_path, negative_points, radius)
+        removal_array = np.asarray(removal.resize(image_size, Image.Resampling.NEAREST).convert("L")) > 64
+        result = np.logical_and(result, np.logical_not(removal_array))
+
+    if not result.any():
+        raise RuntimeError("智能修正会删除整个主体，请改用精细画笔")
+    return Image.fromarray((result * 255).astype(np.uint8), "L")
+
+
 def segment_from_positive_strokes(image_path: Path, points: list[list[float]], radius: float = 18) -> Image.Image:
     """把涂抹当作意图提示，先定位主体，再向外搜索其完整语义边缘。"""
     prompts = _sample_points(points)
