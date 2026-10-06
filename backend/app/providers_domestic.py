@@ -36,8 +36,8 @@ EMOJI_PROMPT = """图1是唯一需要转换的主体，只能使用图1透明区
 先逐项复刻图1：主体类别、原图中可见的外轮廓、姿态、视角、长宽比例、组成部件、数量、已有装饰、分层结构和每种颜色的位置必须一致。不得改成另一种动物、食物或通用卡通形象，不得新增、删除、合并或放大任何可见结构。
 图1透明区域内出现的所有物体共同组成一个不可拆分的组合主体。盘子、托盘、杯子、花盆、包装、底座、支架以及主体承载物都必须保留并一起风格化；例如“蛋糕放在盘子上”必须输出完整的蛋糕和完整的盘子，不能只输出蛋糕。各组成部分的相对位置、遮挡关系和尺寸比例必须与图1一致。
 严格保持图1已有的遮挡边界：如果主体被手、餐具、容器或其他前景物体挡住，只转换图1中实际可见的部分，不推测、不补画、不扩展被遮挡或画面外的部分。输出轮廓必须与图1透明区域的可见轮廓对应，以便原位置替换。
-在主体身份和几何结构不变的前提下进行强度明确的高品质 Emoji 化。整体视觉应约为“七成移动端 Emoji 渲染、三成原物摄影特征”：保留用于辨认原主体的结构与配色，但必须主动去除照片感，不能只是抠图、磨皮、提亮或调色。
-把照片中的细碎纹理、噪点、纤维、细小褶皱和零散高频细节概括成干净、柔和、圆润的连续曲面；强化清晰的立体体积、适度饱满的造型、柔和方向光、自然高光、渐进明暗、轻微内阴影和环境遮蔽。边缘只能由体积和光影形成，禁止任何深色描边、勾线或漫画轮廓。缩小到手机 Emoji 尺寸时仍应有清楚的图标识别度。效果必须与图3至图5的苹果系统 Emoji 材质语言一致，而不是写实照片、扁平插画、漫画贴纸或厚重塑料玩具。
+在主体身份和几何结构不变的前提下进行强度明确的高品质 Emoji 化。整体视觉应约为“八成移动端 Emoji 渲染、两成原物摄影特征”：保留用于辨认原主体的结构与配色，但必须主动去除照片感，不能只是抠图、磨皮、提亮或调色。
+把照片中的细碎纹理、噪点、纤维、细小褶皱和零散高频细节概括成干净、柔和、圆润的连续曲面；强化清晰的立体体积、饱满但不膨胀的造型、柔和方向光、自然高光、渐进明暗、轻微内阴影和环境遮蔽。所有组成物必须使用统一的材质语言和简化程度。边缘只能由体积和光影形成，任何位置都禁止深色描边、彩色勾线或漫画轮廓。缩小到手机 Emoji 尺寸时仍应有清楚的图标识别度。效果必须与图3至图5的苹果系统 Emoji 材质语言一致，而不是写实照片、扁平插画、漫画贴纸或厚重塑料玩具。
 对于花束、植物、毛绒物和复杂甜品，可以简化单片花瓣、叶脉、绒毛、奶油纹路等微观细节，但必须保留主要花朵/叶簇/装饰簇、包装层次、主体数量、相对位置和整体外轮廓。简化纹理不等于删除组成物。
 结果必须一眼就能识别为经过明显 Emoji 风格化，同时继续保持原有主体身份、主要结构、轮廓、颜色分区和组合关系。
 颜色强度必须服从图1：不得自动提亮，不得提高饱和度，不得把低饱和颜色改成鲜艳色或荧光色。白色、奶油色、浅灰色等低饱和区域必须保持低饱和；绿色、黄色、红色等彩色区域的明度与浓度也要接近图1。
@@ -233,14 +233,31 @@ bbox 使用 0 到 999 的归一化坐标。列出所有明显主体，最多 8 �
     return detections
 
 
-async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[bool, str, str]:
+def normalize_emoji_quality(style: str, quality: str) -> tuple[str, str]:
+    style = style.upper()
+    if style not in {"3D_EMOJI", "FLAT_CARTOON", "PHOTOREALISTIC", "INVALID"}:
+        style = "INVALID"
+    quality = quality.upper()
+    if style != "3D_EMOJI":
+        quality = "BAD"
+    elif quality not in {"GOOD", "WEAK"}:
+        quality = "WEAK"
+    return style, quality
+
+
+async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[bool, str, str, str]:
     """分别审核实体一致性和苹果系统 Emoji 风格。"""
     _require_keys()
     prompt = """图1是识别选区内的原主体，图2是生成结果，图3至图5是苹果系统 Emoji 风格参考。请分别审核实体组成与视觉风格。
 允许：材质简化、圆润化、柔和光影，以及杯内原有饮品、冰块、水果、吸管和装饰的风格化。
 不允许：图2出现图1没有的盘子、托盘、底座、支架、容器、包装、食物、装饰、文字或任何新实体；也不允许删除图1已有的主要实体或改变数量。
-风格分类只能是：3D_EMOJI（像图3至图5，圆润半立体、无描边、连续柔和渐变）、FLAT_CARTOON（漫画、粗描边、赛璐璐、平面色块或贴纸插画）、PHOTOREALISTIC（仍接近照片）或 INVALID。
-忽略纯白/透明背景、阴影和细微纹理差异。只返回 JSON：{"pass":true或false,"style":"3D_EMOJI或FLAT_CARTOON或PHOTOREALISTIC或INVALID","added":["新增项"],"missing":["缺失项"],"reason":"简短原因"}。只要 added 或 missing 中存在主要实体，pass 必须为 false。"""
+风格分类只能是：3D_EMOJI、FLAT_CARTOON、PHOTOREALISTIC 或 INVALID。
+对 3D_EMOJI 继续给出质量等级：
+- GOOD：像优秀参考图，主体明显重绘，造型圆润饱满，细节经过统一概括，具有连续柔和的体积明暗、自然高光和轻微环境遮蔽；没有任何可见描边；多个组成物的材质语言一致。
+- WEAK：虽然有一定半立体效果，但仍接近原照片或只是轻度柔化；圆润度、体积光、细节概括不足；不同组成物风格不统一；或者存在轻微插画轮廓、平面渐变和生硬冰块或小部件。
+- BAD：仅用于非 3D_EMOJI，包括明显漫画描边、赛璐璐、扁平色块、贴纸插画、基本未风格化或无效结果。
+判断 GOOD 必须从严，不能因为画面好看或主体一致就判为 GOOD。忽略纯白/透明背景、阴影和细微纹理差异。
+只返回 JSON：{"pass":true或false,"style":"3D_EMOJI或FLAT_CARTOON或PHOTOREALISTIC或INVALID","quality":"GOOD或WEAK或BAD","added":["新增项"],"missing":["缺失项"],"reason":"简短原因"}。只要 added 或 missing 中存在主要实体，pass 必须为 false。"""
     payload = {
         "model": "qwen3.6-plus",
         "input": {"messages": [{"role": "user", "content": [
@@ -262,11 +279,11 @@ async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[
     text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
-        return False, "一致性审核未返回有效结果", "INVALID"
+        return False, "一致性审核未返回有效结果", "INVALID", "BAD"
     try:
         result = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return False, "一致性审核结果无法解析", "INVALID"
+        return False, "一致性审核结果无法解析", "INVALID", "BAD"
     added = result.get("added") if isinstance(result.get("added"), list) else []
     missing = result.get("missing") if isinstance(result.get("missing"), list) else []
     passed = result.get("pass") is True and not added and not missing
@@ -275,10 +292,11 @@ async def audit_emoji_consistency(source_path: Path, emoji_path: Path) -> tuple[
         reason = "新增了：" + "、".join(map(str, added))
     elif missing:
         reason = "缺少了：" + "、".join(map(str, missing))
-    style = str(result.get("style") or "INVALID").upper()
-    if style not in {"3D_EMOJI", "FLAT_CARTOON", "PHOTOREALISTIC", "INVALID"}:
-        style = "INVALID"
-    return passed, reason, style
+    style, quality = normalize_emoji_quality(
+        str(result.get("style") or "INVALID"),
+        str(result.get("quality") or ""),
+    )
+    return passed, reason, style, quality
 
 
 async def detect_objects_hybrid(image_path: Path) -> list[dict[str, Any]]:
@@ -336,7 +354,7 @@ async def _dashscope_generate(model: str, content: list[dict[str, str]], paramet
 
 
 async def generate_emoji_domestic(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False, correction: str = "") -> None:
-    retry_note = "\n这是纠偏重试：上一版未同时满足结构一致和明显 Emoji 化。保持较强的移动端半立体 Emoji 风格，不得退回写实照片或只改变表面色调；同时严格逐项复刻图1的可见外轮廓、所有可见承载物、盘子、托盘、底座、容器、主要结构、已有五官和颜色分区。可以进一步概括微小摄影纹理，但任何主要组成部分都不能删除，也不要补画被遮挡或画面外的部分。" if strict else ""
+    retry_note = "\n这是纠偏重试：上一版未达到优质 Emoji 标准。必须明显增强圆润饱满的半立体体积、连续柔和明暗、自然高光、轻微内阴影与环境遮蔽，并统一所有组成物的材质语言；完全去除描边、插画线条、生硬平面渐变和残余照片纹理。不得退回写实照片或只改变表面色调；同时严格逐项复刻图1的可见外轮廓、所有可见承载物、盘子、托盘、底座、容器、主要结构、已有五官和颜色分区。任何主要组成部分都不能删除，也不要补画被遮挡或画面外的部分。" if strict else ""
     if correction:
         retry_note += "\n本次必须重点修正：" + correction[:400]
     # 第二张图降到极低频，只传递整图明暗和色温布局，不携带可识别物体。

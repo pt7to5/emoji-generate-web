@@ -3,6 +3,7 @@ import asyncio
 from PIL import Image, ImageDraw
 
 from app.image_ops import apply_repair_inside_mask, bbox_from_mask, bbox_from_strokes, complete_subject_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, emoji_style_difference, expand_detection_box, expand_mask, fill_enclosed_holes, filter_candidates, is_complete_subject, mask_needs_completion, match_color_intensity, preserve_color_layout, remove_white_matte
+from app.providers_domestic import normalize_emoji_quality
 from app import main
 
 
@@ -196,6 +197,13 @@ def test_emoji_style_check_rejects_source_copy_and_accepts_visible_rendering_cha
     assert not emoji_is_visibly_stylized(lightly_adjusted, source)
     assert emoji_is_visibly_stylized(stylized, source)
     assert emoji_style_difference(stylized, source) > emoji_style_difference(lightly_adjusted, source)
+
+
+def test_emoji_quality_requires_good_3d_style():
+    assert normalize_emoji_quality("3d_emoji", "good") == ("3D_EMOJI", "GOOD")
+    assert normalize_emoji_quality("3D_EMOJI", "") == ("3D_EMOJI", "WEAK")
+    assert normalize_emoji_quality("FLAT_CARTOON", "GOOD") == ("FLAT_CARTOON", "BAD")
+    assert normalize_emoji_quality("unknown", "GOOD") == ("INVALID", "BAD")
 
 
 def test_color_intensity_reduces_only_excess_brightness_and_saturation():

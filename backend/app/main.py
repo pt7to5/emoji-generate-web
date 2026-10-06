@@ -332,12 +332,17 @@ async def make_emoji(request: EmojiRequest):
         rgba = await baidu_segment(raw_path, None, "rgba")
         transparent = remove_white_matte(rgba)
         audit_path = folder / f"audit_{request.objectId}.png"; save_png(transparent, audit_path)
-        semantic_ok, semantic_reason, style_class = await audit_emoji_consistency(cutout_path, audit_path)
+        semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_consistency(cutout_path, audit_path)
         structure_ok = emoji_matches_source(transparent, cutout_image)
-        style_ok = style_class == "3D_EMOJI" and emoji_is_visibly_stylized(transparent, cutout_image)
+        visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
+        style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
+        style_ok = style_acceptable and style_quality == "GOOD"
         if not structure_ok or not style_ok or not semantic_ok:
             first_candidate = transparent.copy()
-            first_structure_ok, first_semantic_ok, first_style_ok = structure_ok, semantic_ok, style_ok
+            first_structure_ok, first_semantic_ok = structure_ok, semantic_ok
+            first_style_acceptable = style_acceptable
+            first_style_class = style_class
+            first_style_quality = style_quality
             first_style_score = emoji_style_difference(first_candidate, cutout_image)
             first_path = folder / f"audit_{request.objectId}_first.png"
             save_png(transparent, first_path)
@@ -349,31 +354,45 @@ async def make_emoji(request: EmojiRequest):
                     corrections.append("上一版是二维漫画风；彻底移除描边、勾线、赛璐璐阴影和平面色块，严格改为参考图3至图5的苹果系统圆润半立体 Emoji 材质")
                 elif style_class == "PHOTOREALISTIC":
                     corrections.append("上一版仍过于写实；显著增强圆润半立体 Emoji 重绘效果并概括摄影纹理")
+                elif style_class == "3D_EMOJI" and style_quality == "WEAK":
+                    corrections.append("上一版只有较弱的 Emoji 化；增强圆润饱满体积、柔和高光和环境遮蔽，统一各组成物材质，去除轻微描边、平面渐变和残余照片纹理")
                 else:
                     corrections.append("严格使用参考图3至图5的苹果系统圆润半立体 Emoji 风格，无描边、连续柔和渐变、自然高光和轻微环境遮蔽")
             if not semantic_ok:
                 corrections.append(f"消除实体组成错误：{semantic_reason or '不得新增或遗漏任何主要实体'}")
             logger.info(
                 "emoji first candidate rejected image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
-                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}: {semantic_reason}",
+                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
             )
             await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections))
             rgba = await baidu_segment(raw_path, None, "rgba")
             transparent = remove_white_matte(rgba)
             save_png(transparent, audit_path)
-            semantic_ok, semantic_reason, style_class = await audit_emoji_consistency(cutout_path, audit_path)
+            semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_consistency(cutout_path, audit_path)
             structure_ok = emoji_matches_source(transparent, cutout_image)
-            style_ok = style_class == "3D_EMOJI" and emoji_is_visibly_stylized(transparent, cutout_image)
+            visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
+            style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
+            style_ok = style_acceptable and style_quality == "GOOD"
             retry_style_score = emoji_style_difference(transparent, cutout_image)
             logger.info(
                 "emoji correction candidate image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
-                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}: {semantic_reason}",
+                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
             )
-            retry_critical_ok = structure_ok and semantic_ok and style_ok
-            first_critical_ok = first_structure_ok and first_semantic_ok and first_style_ok
-            if first_critical_ok and (not retry_critical_ok or first_style_score > retry_style_score):
+            retry_acceptable = structure_ok and semantic_ok and style_acceptable
+            first_acceptable = first_structure_ok and first_semantic_ok and first_style_acceptable
+            quality_rank = {"BAD": 0, "WEAK": 1, "GOOD": 2}
+            first_rank = quality_rank.get(first_style_quality, 0)
+            retry_rank = quality_rank.get(style_quality, 0)
+            if first_acceptable and (
+                not retry_acceptable
+                or first_rank > retry_rank
+                or (first_rank == retry_rank and first_style_score > retry_style_score)
+            ):
                 transparent = first_candidate
-                structure_ok, semantic_ok, style_ok = first_structure_ok, first_semantic_ok, first_style_ok
+                structure_ok, semantic_ok = first_structure_ok, first_semantic_ok
+                style_class = first_style_class
+                style_quality = first_style_quality
+                style_acceptable = first_style_acceptable
                 logger.info(
                     "emoji selected first candidate image_id=%s object_id=%s first_style_score=%.2f retry_style_score=%.2f",
                     request.imageId, request.objectId, first_style_score, retry_style_score,
@@ -382,8 +401,8 @@ async def make_emoji(request: EmojiRequest):
                 raise RuntimeError("生成结果未完整保留原主体结构，请重新生成")
             if not semantic_ok:
                 raise RuntimeError(f"生成结果与原主体不一致：{semantic_reason or '新增或缺少了实体'}")
-            if not style_ok:
-                raise RuntimeError(f"生成结果不是苹果系统 Emoji 风格：{style_class}")
+            if not style_acceptable:
+                raise RuntimeError(f"生成结果未达到圆润无描边的 Emoji 风格：{style_class}/{style_quality}")
         # 不再进行九宫格颜色校正；该步骤会造成明显矩形色块。
         save_png(match_color_intensity(transparent, cutout_image), output_path)
         logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))
