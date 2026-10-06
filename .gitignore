@@ -11,6 +11,7 @@ backend/.venv/
 backend/data/
 backend/*.log
 .pytest_cache/
+.pytest_*/
 .test-tmp*/
 work/
 outputs/

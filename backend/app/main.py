@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from PIL import Image
+from PIL import Image, ImageChops
 from .config import BAIDU_PROCESS_API_KEY, BAIDU_PROCESS_SECRET_KEY, CORS_ORIGINS, DASHSCOPE_API_KEY, DATA_DIR, MAX_IMAGE_SIDE, MAX_UPLOAD_BYTES, PUBLIC_BASE_URL
 from .image_ops import apply_repair_inside_mask, bbox_from_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, emoji_style_difference, expand_mask, filter_candidates, is_complete_subject, mask_from_image, match_color_intensity, normalize_image, remove_white_matte, save_png
 from .providers_domestic import audit_emoji_consistency, baidu_segment, detect_objects_hybrid, generate_emoji_domestic, repair_background_domestic
@@ -85,6 +85,32 @@ async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, outp
                 await asyncio.sleep(.8)
     assert last_error is not None
     raise last_error
+
+
+async def extract_transparent_emoji(raw_path: Path) -> Image.Image:
+    """优先使用云端精细抠图；服务异常时保留已生成图片并本地去白底。"""
+    try:
+        rgba = await baidu_segment(raw_path, None, "rgba")
+    except Exception as exc:
+        logger.warning("emoji segmentation degraded to local matte removal: %s", exc)
+        rgba = Image.open(raw_path).convert("RGBA")
+        if rgba.getchannel("A").getextrema() == (255, 255):
+            red, green, blue = rgba.convert("RGB").split()
+            distance_from_white = ImageChops.lighter(
+                ImageChops.invert(red),
+                ImageChops.lighter(ImageChops.invert(green), ImageChops.invert(blue)),
+            )
+            rgba.putalpha(distance_from_white.point(lambda value: min(255, value * 4)))
+    return remove_white_matte(rgba)
+
+
+async def audit_emoji_safely(source_path: Path, emoji_path: Path) -> tuple[bool, str, str, str]:
+    """审核服务只影响候选排序，不影响已经成功生成的图片返回。"""
+    try:
+        return await audit_emoji_consistency(source_path, emoji_path)
+    except Exception as exc:
+        logger.warning("emoji audit unavailable; accepting candidate with weak quality: %s", exc)
+        return True, "审核服务暂不可用", "3D_EMOJI", "WEAK"
 
 
 def background_cache_path(folder: Path, object_id: str) -> Path:
@@ -328,11 +354,10 @@ async def make_emoji(request: EmojiRequest):
         # 每次点击都重新生成，避免提示词或蒙版改变后仍复用旧缓存。
         generation_started = time.perf_counter()
         await generate_emoji_with_retry(cutout_path, original_path, raw_path)
-        # 万相不输出可靠透明通道，再次使用百度智能抠图生成透明 PNG。
-        rgba = await baidu_segment(raw_path, None, "rgba")
-        transparent = remove_white_matte(rgba)
+        # 云端精细抠图异常时降级为本地去白底，避免已有生成图被丢弃。
+        transparent = await extract_transparent_emoji(raw_path)
         audit_path = folder / f"audit_{request.objectId}.png"; save_png(transparent, audit_path)
-        semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_consistency(cutout_path, audit_path)
+        semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path)
         structure_ok = emoji_matches_source(transparent, cutout_image)
         visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
         style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
@@ -364,45 +389,61 @@ async def make_emoji(request: EmojiRequest):
                 "emoji first candidate rejected image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
                 request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
             )
-            await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections))
-            rgba = await baidu_segment(raw_path, None, "rgba")
-            transparent = remove_white_matte(rgba)
-            save_png(transparent, audit_path)
-            semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_consistency(cutout_path, audit_path)
-            structure_ok = emoji_matches_source(transparent, cutout_image)
-            visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
-            style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
-            style_ok = style_acceptable and style_quality == "GOOD"
-            retry_style_score = emoji_style_difference(transparent, cutout_image)
-            logger.info(
-                "emoji correction candidate image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
-                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
-            )
-            retry_acceptable = structure_ok and semantic_ok and style_acceptable
-            first_acceptable = first_structure_ok and first_semantic_ok and first_style_acceptable
+            try:
+                await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections))
+                transparent = await extract_transparent_emoji(raw_path)
+                save_png(transparent, audit_path)
+                semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path)
+                structure_ok = emoji_matches_source(transparent, cutout_image)
+                visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
+                style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
+                style_ok = style_acceptable and style_quality == "GOOD"
+                retry_style_score = emoji_style_difference(transparent, cutout_image)
+                logger.info(
+                    "emoji correction candidate image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
+                    request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "emoji correction failed; returning first candidate image_id=%s object_id=%s error=%s",
+                    request.imageId, request.objectId, exc,
+                )
+                transparent = first_candidate
+                structure_ok, semantic_ok = first_structure_ok, first_semantic_ok
+                style_class = first_style_class
+                style_quality = first_style_quality
+                style_acceptable = first_style_acceptable
+                retry_style_score = -1
             quality_rank = {"BAD": 0, "WEAK": 1, "GOOD": 2}
             first_rank = quality_rank.get(first_style_quality, 0)
             retry_rank = quality_rank.get(style_quality, 0)
-            if first_acceptable and (
-                not retry_acceptable
-                or first_rank > retry_rank
-                or (first_rank == retry_rank and first_style_score > retry_style_score)
-            ):
+            first_candidate_score = (
+                int(first_semantic_ok) * 4
+                + int(first_structure_ok) * 4
+                + first_rank * 2
+                + min(first_style_score, 40) / 40
+            )
+            retry_candidate_score = (
+                int(semantic_ok) * 4
+                + int(structure_ok) * 4
+                + retry_rank * 2
+                + min(max(retry_style_score, 0), 40) / 40
+            )
+            if first_candidate_score > retry_candidate_score:
                 transparent = first_candidate
                 structure_ok, semantic_ok = first_structure_ok, first_semantic_ok
                 style_class = first_style_class
                 style_quality = first_style_quality
                 style_acceptable = first_style_acceptable
                 logger.info(
-                    "emoji selected first candidate image_id=%s object_id=%s first_style_score=%.2f retry_style_score=%.2f",
-                    request.imageId, request.objectId, first_style_score, retry_style_score,
+                    "emoji selected first candidate image_id=%s object_id=%s first_score=%.2f retry_score=%.2f",
+                    request.imageId, request.objectId, first_candidate_score, retry_candidate_score,
                 )
-            if not structure_ok:
-                raise RuntimeError("生成结果未完整保留原主体结构，请重新生成")
-            if not semantic_ok:
-                raise RuntimeError(f"生成结果与原主体不一致：{semantic_reason or '新增或缺少了实体'}")
-            if not style_acceptable:
-                raise RuntimeError(f"生成结果未达到圆润无描边的 Emoji 风格：{style_class}/{style_quality}")
+            if not structure_ok or not semantic_ok or not style_acceptable:
+                logger.warning(
+                    "emoji returning best available candidate image_id=%s object_id=%s structure_ok=%s semantic_ok=%s style=%s/%s",
+                    request.imageId, request.objectId, structure_ok, semantic_ok, style_class, style_quality,
+                )
         # 不再进行九宫格颜色校正；该步骤会造成明显矩形色块。
         save_png(match_color_intensity(transparent, cutout_image), output_path)
         logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))

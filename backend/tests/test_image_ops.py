@@ -206,6 +206,37 @@ def test_emoji_quality_requires_good_3d_style():
     assert normalize_emoji_quality("unknown", "GOOD") == ("INVALID", "BAD")
 
 
+def test_emoji_segmentation_falls_back_to_local_white_matte(tmp_path, monkeypatch):
+    raw_path = tmp_path / "generated.png"
+    Image.new("RGB", (20, 20), "white").save(raw_path)
+    image = Image.open(raw_path).convert("RGB")
+    ImageDraw.Draw(image).ellipse((4, 4, 15, 15), fill=(200, 80, 60))
+    image.save(raw_path)
+
+    async def unavailable(*_args, **_kwargs):
+        raise RuntimeError("segment unavailable")
+
+    monkeypatch.setattr(main, "baidu_segment", unavailable)
+    result = asyncio.run(main.extract_transparent_emoji(raw_path))
+    assert result.mode == "RGBA"
+    assert result.getchannel("A").getpixel((0, 0)) < 255
+    assert result.getchannel("A").getpixel((10, 10)) > 0
+
+
+def test_emoji_audit_failure_degrades_to_weak_candidate(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    emoji = tmp_path / "emoji.png"
+    Image.new("RGB", (10, 10), "white").save(source)
+    Image.new("RGB", (10, 10), "white").save(emoji)
+
+    async def unavailable(*_args, **_kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(main, "audit_emoji_consistency", unavailable)
+    result = asyncio.run(main.audit_emoji_safely(source, emoji))
+    assert result == (True, "审核服务暂不可用", "3D_EMOJI", "WEAK")
+
+
 def test_color_intensity_reduces_only_excess_brightness_and_saturation():
     source = Image.new("RGBA", (40, 40), (120, 145, 110, 255))
     vivid = Image.new("RGBA", (40, 40), (120, 255, 30, 255))
