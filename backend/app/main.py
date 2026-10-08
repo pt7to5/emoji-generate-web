@@ -90,7 +90,7 @@ async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, outp
 async def extract_transparent_emoji(raw_path: Path) -> Image.Image:
     """优先使用云端精细抠图；服务异常时保留已生成图片并本地去白底。"""
     try:
-        rgba = await baidu_segment(raw_path, None, "rgba")
+        rgba = await asyncio.wait_for(baidu_segment(raw_path, None, "rgba"), timeout=12)
     except Exception as exc:
         logger.warning("emoji segmentation degraded to local matte removal: %s", exc)
         rgba = Image.open(raw_path).convert("RGBA")
@@ -107,7 +107,7 @@ async def extract_transparent_emoji(raw_path: Path) -> Image.Image:
 async def audit_emoji_safely(source_path: Path, emoji_path: Path) -> tuple[bool, str, str, str]:
     """审核服务只影响候选排序，不影响已经成功生成的图片返回。"""
     try:
-        return await audit_emoji_consistency(source_path, emoji_path)
+        return await asyncio.wait_for(audit_emoji_consistency(source_path, emoji_path), timeout=15)
     except Exception as exc:
         logger.warning("emoji audit unavailable; accepting candidate with weak quality: %s", exc)
         return True, "审核服务暂不可用", "3D_EMOJI", "WEAK"
@@ -348,21 +348,25 @@ async def make_emoji(request: EmojiRequest):
     cutout_path = folder / f"cutout_{request.objectId}.png"; save_png(cutout_image, cutout_path)
     raw_path = folder / f"styled_{request.objectId}.png"
     output_path = folder / f"emoji_{request.objectId}_{uuid.uuid4().hex[:6]}.png"
-    background_started = time.perf_counter()
-    background_task = asyncio.create_task(ensure_background_cache(folder, request.objectId, original_path))
     try:
         # 每次点击都重新生成，避免提示词或蒙版改变后仍复用旧缓存。
         generation_started = time.perf_counter()
+        stage_started = time.perf_counter()
         await generate_emoji_with_retry(cutout_path, original_path, raw_path)
+        logger.info("emoji stage image_id=%s object_id=%s stage=generate elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
         # 云端精细抠图异常时降级为本地去白底，避免已有生成图被丢弃。
+        stage_started = time.perf_counter()
         transparent = await extract_transparent_emoji(raw_path)
+        logger.info("emoji stage image_id=%s object_id=%s stage=cutout elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
         audit_path = folder / f"audit_{request.objectId}.png"; save_png(transparent, audit_path)
+        stage_started = time.perf_counter()
         semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path)
+        logger.info("emoji stage image_id=%s object_id=%s stage=audit elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
         structure_ok = emoji_matches_source(transparent, cutout_image)
         visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
         style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
-        style_ok = style_acceptable and style_quality == "GOOD"
-        if not structure_ok or not style_ok or not semantic_ok:
+        style_ok = style_acceptable
+        if not structure_ok or not style_acceptable or not semantic_ok:
             first_candidate = transparent.copy()
             first_structure_ok, first_semantic_ok = structure_ok, semantic_ok
             first_style_acceptable = style_acceptable
@@ -374,7 +378,7 @@ async def make_emoji(request: EmojiRequest):
             corrections: list[str] = []
             if not structure_ok:
                 corrections.append("完整保留原主体外轮廓、长宽比例和所有主要组成部分，不能缺边、扩大或改变形状")
-            if not style_ok:
+            if not style_acceptable:
                 if style_class == "FLAT_CARTOON":
                     corrections.append("上一版是二维漫画风；彻底移除描边、勾线、赛璐璐阴影和平面色块，严格改为参考图3至图5的苹果系统圆润半立体 Emoji 材质")
                 elif style_class == "PHOTOREALISTIC":
@@ -390,14 +394,20 @@ async def make_emoji(request: EmojiRequest):
                 request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
             )
             try:
+                stage_started = time.perf_counter()
                 await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections))
+                logger.info("emoji stage image_id=%s object_id=%s stage=retry_generate elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
+                stage_started = time.perf_counter()
                 transparent = await extract_transparent_emoji(raw_path)
+                logger.info("emoji stage image_id=%s object_id=%s stage=retry_cutout elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
                 save_png(transparent, audit_path)
+                stage_started = time.perf_counter()
                 semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path)
+                logger.info("emoji stage image_id=%s object_id=%s stage=retry_audit elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
                 structure_ok = emoji_matches_source(transparent, cutout_image)
                 visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
                 style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
-                style_ok = style_acceptable and style_quality == "GOOD"
+                style_ok = style_acceptable
                 retry_style_score = emoji_style_difference(transparent, cutout_image)
                 logger.info(
                     "emoji correction candidate image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
@@ -448,12 +458,8 @@ async def make_emoji(request: EmojiRequest):
         save_png(match_color_intensity(transparent, cutout_image), output_path)
         logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))
     except asyncio.TimeoutError as exc:
-        background_task.cancel()
-        await asyncio.gather(background_task, return_exceptions=True)
-        raise HTTPException(504, "Emoji 生成超过 60 秒") from exc
+        raise HTTPException(504, "Emoji 生成服务响应超时，请再试一次") from exc
     except Exception as exc:
-        background_task.cancel()
-        await asyncio.gather(background_task, return_exceptions=True)
         message = provider_error_message(exc)
         lower = message.lower()
         if "429" in lower or "rate" in lower or "thrott" in lower:
@@ -465,12 +471,6 @@ async def make_emoji(request: EmojiRequest):
         else:
             detail = f"风格化生成失败：{message[:180]}"
         raise HTTPException(502, detail) from exc
-    try:
-        _, cache_hit = await background_task
-        logger.info("background prepared image_id=%s object_id=%s cache_hit=%s elapsed_ms=%d", request.imageId, request.objectId, cache_hit, round((time.perf_counter()-background_started)*1000))
-    except Exception:
-        # 预生成失败不影响 Emoji 输出；合成阶段会沿用原来的错误处理并再次尝试。
-        logger.warning("background pre-generation failed image_id=%s object_id=%s", request.imageId, request.objectId, exc_info=True)
     return {"emojiUrl": file_url(output_path), "elapsedMs": round((time.perf_counter()-started)*1000)}
 
 
