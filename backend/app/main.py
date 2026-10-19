@@ -10,10 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image, ImageChops
-from .config import BAIDU_PROCESS_API_KEY, BAIDU_PROCESS_SECRET_KEY, CORS_ORIGINS, DASHSCOPE_API_KEY, DATA_DIR, MAX_IMAGE_SIDE, MAX_UPLOAD_BYTES, PUBLIC_BASE_URL
+from .config import BAIDU_PROCESS_API_KEY, BAIDU_PROCESS_SECRET_KEY, CORS_ORIGINS, DASHSCOPE_API_KEY, DATA_DIR, EMOJI_AUDIT_TIMEOUT_SECONDS, EMOJI_GENERATION_TARGET_SECONDS, EMOJI_PROMPT_VERSION, MAX_IMAGE_SIDE, MAX_UPLOAD_BYTES, PUBLIC_BASE_URL
 from .image_ops import apply_repair_inside_mask, bbox_from_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, emoji_style_difference, expand_mask, filter_candidates, is_complete_subject, mask_from_image, match_color_intensity, normalize_image, remove_white_matte, save_png
-from .providers_domestic import audit_emoji_consistency, baidu_segment, detect_objects_hybrid, generate_emoji_domestic, repair_background_domestic
+from .providers_domestic import audit_emoji_consistency, baidu_segment, classify_subject_category, detect_objects_hybrid, generate_emoji_domestic, repair_background_domestic
 from .local_segmentation import segment_from_detection_box, segment_from_guided_strokes, segment_from_positive_strokes
+from .quality import efficiency_score, load_and_validate, score_candidate
 
 app = FastAPI(title="Object Emoji MVP")
 logger = logging.getLogger("object-emoji")
@@ -73,11 +74,11 @@ async def repair_background_with_retry(input_path: Path, bbox: list[int], output
     raise last_error
 
 
-async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False, correction: str = "") -> None:
+async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False, correction: str = "", category: str = "food") -> None:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            await asyncio.wait_for(generate_emoji_domestic(cutout_path, original_path, output_path, strict=strict, correction=correction), timeout=180)
+            await asyncio.wait_for(generate_emoji_domestic(cutout_path, original_path, output_path, strict=strict, correction=correction, category=category), timeout=180)
             return
         except Exception as exc:
             last_error = exc
@@ -104,10 +105,13 @@ async def extract_transparent_emoji(raw_path: Path) -> Image.Image:
     return remove_white_matte(rgba)
 
 
-async def audit_emoji_safely(source_path: Path, emoji_path: Path) -> tuple[bool, str, str, str]:
+async def audit_emoji_safely(source_path: Path, emoji_path: Path, category: str = "food") -> tuple[bool, str, str, str]:
     """审核服务只影响候选排序，不影响已经成功生成的图片返回。"""
     try:
-        return await asyncio.wait_for(audit_emoji_consistency(source_path, emoji_path), timeout=15)
+        return await asyncio.wait_for(
+            audit_emoji_consistency(source_path, emoji_path, category=category),
+            timeout=EMOJI_AUDIT_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         logger.warning("emoji audit unavailable; accepting candidate with weak quality: %s", exc)
         return True, "审核服务暂不可用", "3D_EMOJI", "WEAK"
@@ -117,6 +121,17 @@ def background_cache_path(folder: Path, object_id: str) -> Path:
     mask_path = folder / f"mask_{object_id}.png"
     version = mask_path.stat().st_mtime_ns
     return folder / f"background_{object_id}_{version}.png"
+
+
+def choose_first_candidate(first_report, retry_report, *, first_acceptable: bool, retry_acceptable: bool) -> bool:
+    """完整一致性优先于图片可解码性和软评分，避免选回姿态错误的高分首图。"""
+    if retry_report is None:
+        return True
+    if first_acceptable != retry_acceptable:
+        return first_acceptable
+    if first_report.valid != retry_report.valid:
+        return first_report.valid
+    return first_report.total > retry_report.total
 
 
 async def ensure_background_cache(folder: Path, object_id: str, input_path: Path) -> tuple[Path, bool]:
@@ -341,6 +356,7 @@ async def precise_edit_object_mask(image_id: str, object_id: str, request: Preci
 @app.post("/api/emojis")
 async def make_emoji(request: EmojiRequest):
     started = time.perf_counter(); folder = item_dir(request.imageId)
+    metrics = {"firstImageMs": 0, "auditMs": 0, "retryMs": 0, "totalMs": 0}
     original_path = folder / "original.png"
     original = Image.open(original_path).convert("RGB")
     mask = Image.open(folder / f"mask_{request.objectId}.png").convert("L")
@@ -349,33 +365,48 @@ async def make_emoji(request: EmojiRequest):
     raw_path = folder / f"styled_{request.objectId}.png"
     output_path = folder / f"emoji_{request.objectId}_{uuid.uuid4().hex[:6]}.png"
     try:
+        try:
+            category = await asyncio.wait_for(classify_subject_category(cutout_path), timeout=30)
+        except Exception as exc:
+            category = "food"
+            logger.warning("subject category unavailable; falling back to food references: %s", exc)
         # 每次点击都重新生成，避免提示词或蒙版改变后仍复用旧缓存。
         generation_started = time.perf_counter()
         stage_started = time.perf_counter()
-        await generate_emoji_with_retry(cutout_path, original_path, raw_path)
+        await generate_emoji_with_retry(cutout_path, original_path, raw_path, category=category)
+        load_and_validate(raw_path)
         logger.info("emoji stage image_id=%s object_id=%s stage=generate elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
         # 云端精细抠图异常时降级为本地去白底，避免已有生成图被丢弃。
         stage_started = time.perf_counter()
         transparent = await extract_transparent_emoji(raw_path)
+        metrics["firstImageMs"] = round((time.perf_counter()-generation_started)*1000)
         logger.info("emoji stage image_id=%s object_id=%s stage=cutout elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
         audit_path = folder / f"audit_{request.objectId}.png"; save_png(transparent, audit_path)
         stage_started = time.perf_counter()
-        semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path)
+        semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path, category)
+        metrics["auditMs"] += round((time.perf_counter()-stage_started)*1000)
         logger.info("emoji stage image_id=%s object_id=%s stage=audit elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
         structure_ok = emoji_matches_source(transparent, cutout_image)
         visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
         style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
         style_ok = style_acceptable
-        if not structure_ok or not style_acceptable or not semantic_ok:
+        audit_available = semantic_reason != "审核服务暂不可用"
+        first_report = score_candidate(transparent, cutout_image, semantic_ok=semantic_ok, style_class=style_class, style_quality=style_quality, audit_available=audit_available, audit_reason=semantic_reason)
+        selected_report = first_report
+        retried = False
+        if not first_report.valid or not structure_ok or not style_acceptable or not semantic_ok:
             first_candidate = transparent.copy()
             first_structure_ok, first_semantic_ok = structure_ok, semantic_ok
             first_style_acceptable = style_acceptable
             first_style_class = style_class
             first_style_quality = style_quality
             first_style_score = emoji_style_difference(first_candidate, cutout_image)
+            first_acceptable = first_report.valid and first_structure_ok and first_semantic_ok and first_style_acceptable
             first_path = folder / f"audit_{request.objectId}_first.png"
             save_png(transparent, first_path)
             corrections: list[str] = []
+            if not first_report.valid:
+                corrections.append("修复无效输出：" + "、".join(first_report.invalid_reasons))
             if not structure_ok:
                 corrections.append("完整保留原主体外轮廓、长宽比例和所有主要组成部分，不能缺边、扩大或改变形状")
             if not style_acceptable:
@@ -388,27 +419,34 @@ async def make_emoji(request: EmojiRequest):
                 else:
                     corrections.append("严格使用参考图3至图5的苹果系统圆润半立体 Emoji 风格，无描边、连续柔和渐变、自然高光和轻微环境遮蔽")
             if not semantic_ok:
-                corrections.append(f"消除实体组成错误：{semantic_reason or '不得新增或遗漏任何主要实体'}")
+                corrections.append(f"修复主体一致性错误：{semantic_reason or '不得改变镜头角度、姿态、透视、遮挡或主要实体'}。严格恢复图1的 yaw、pitch、roll、头身朝向、身体轴线、四肢位置、前后层级和透视缩短；禁止正面化、左右对称化、扶正或改成标准姿势")
             logger.info(
                 "emoji first candidate rejected image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
                 request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
             )
             try:
+                retried = True
+                retry_started = time.perf_counter()
                 stage_started = time.perf_counter()
-                await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections))
+                await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections), category=category)
+                load_and_validate(raw_path)
                 logger.info("emoji stage image_id=%s object_id=%s stage=retry_generate elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
                 stage_started = time.perf_counter()
                 transparent = await extract_transparent_emoji(raw_path)
                 logger.info("emoji stage image_id=%s object_id=%s stage=retry_cutout elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
                 save_png(transparent, audit_path)
                 stage_started = time.perf_counter()
-                semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path)
+                semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path, category)
+                metrics["auditMs"] += round((time.perf_counter()-stage_started)*1000)
                 logger.info("emoji stage image_id=%s object_id=%s stage=retry_audit elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
                 structure_ok = emoji_matches_source(transparent, cutout_image)
                 visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
                 style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
                 style_ok = style_acceptable
                 retry_style_score = emoji_style_difference(transparent, cutout_image)
+                audit_available = semantic_reason != "审核服务暂不可用"
+                retry_report = score_candidate(transparent, cutout_image, semantic_ok=semantic_ok, style_class=style_class, style_quality=style_quality, audit_available=audit_available, audit_reason=semantic_reason)
+                metrics["retryMs"] = round((time.perf_counter()-retry_started)*1000)
                 logger.info(
                     "emoji correction candidate image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
                     request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
@@ -424,36 +462,35 @@ async def make_emoji(request: EmojiRequest):
                 style_quality = first_style_quality
                 style_acceptable = first_style_acceptable
                 retry_style_score = -1
-            quality_rank = {"BAD": 0, "WEAK": 1, "GOOD": 2}
-            first_rank = quality_rank.get(first_style_quality, 0)
-            retry_rank = quality_rank.get(style_quality, 0)
-            first_candidate_score = (
-                int(first_semantic_ok) * 4
-                + int(first_structure_ok) * 4
-                + first_rank * 2
-                + min(first_style_score, 40) / 40
+                retry_report = None
+            # 硬校验优先；两个都有效时再比较四维软评分。审核超时仅降低置信度，不隐藏图片。
+            retry_acceptable = bool(retry_report and retry_report.valid and structure_ok and semantic_ok and style_acceptable)
+            choose_first = choose_first_candidate(
+                first_report,
+                retry_report,
+                first_acceptable=first_acceptable,
+                retry_acceptable=retry_acceptable,
             )
-            retry_candidate_score = (
-                int(semantic_ok) * 4
-                + int(structure_ok) * 4
-                + retry_rank * 2
-                + min(max(retry_style_score, 0), 40) / 40
-            )
-            if first_candidate_score > retry_candidate_score:
+            if choose_first:
                 transparent = first_candidate
                 structure_ok, semantic_ok = first_structure_ok, first_semantic_ok
                 style_class = first_style_class
                 style_quality = first_style_quality
                 style_acceptable = first_style_acceptable
+                selected_report = first_report
                 logger.info(
                     "emoji selected first candidate image_id=%s object_id=%s first_score=%.2f retry_score=%.2f",
-                    request.imageId, request.objectId, first_candidate_score, retry_candidate_score,
+                    request.imageId, request.objectId, first_report.total, retry_report.total if retry_report else -1,
                 )
+            else:
+                selected_report = retry_report
             if not structure_ok or not semantic_ok or not style_acceptable:
                 logger.warning(
                     "emoji returning best available candidate image_id=%s object_id=%s structure_ok=%s semantic_ok=%s style=%s/%s",
                     request.imageId, request.objectId, structure_ok, semantic_ok, style_class, style_quality,
                 )
+        if not selected_report.valid:
+            raise ValueError("两次生成均未通过硬性图片有效性校验：" + "、".join(selected_report.invalid_reasons))
         # 不再进行九宫格颜色校正；该步骤会造成明显矩形色块。
         save_png(match_color_intensity(transparent, cutout_image), output_path)
         logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))
@@ -471,7 +508,17 @@ async def make_emoji(request: EmojiRequest):
         else:
             detail = f"风格化生成失败：{message[:180]}"
         raise HTTPException(502, detail) from exc
-    return {"emojiUrl": file_url(output_path), "elapsedMs": round((time.perf_counter()-started)*1000)}
+    metrics["totalMs"] = round((time.perf_counter()-started)*1000)
+    return {
+        "emojiUrl": file_url(output_path),
+        "elapsedMs": metrics["totalMs"],
+        "promptVersion": EMOJI_PROMPT_VERSION,
+        "category": category,
+        "retried": retried,
+        "quality": selected_report.as_dict(),
+        "timings": metrics,
+        "generationEfficiencyScore": efficiency_score(metrics["totalMs"], EMOJI_GENERATION_TARGET_SECONDS),
+    }
 
 
 @app.post("/api/compositions")

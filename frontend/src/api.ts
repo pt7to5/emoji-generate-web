@@ -19,12 +19,23 @@ export type UploadResult = {
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const apiUrl = (path: string) => `${API_BASE}${path}`
 
+function resolveResponseUrls(value: unknown): unknown {
+  if (!API_BASE || value === null || typeof value !== 'object') return value
+  if (Array.isArray(value)) return value.map(resolveResponseUrls)
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+    if (key.endsWith('Url') && typeof item === 'string' && item.startsWith('/')) {
+      return [key, `${API_BASE}${item}`]
+    }
+    return [key, resolveResponseUrls(item)]
+  }))
+}
+
 async function json<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: '请求失败' }))
     throw new Error(body.detail || '请求失败')
   }
-  return response.json() as Promise<T>
+  return resolveResponseUrls(await response.json()) as T
 }
 
 export async function uploadImage(file: File, signal?: AbortSignal): Promise<UploadResult> {
