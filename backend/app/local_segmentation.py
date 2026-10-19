@@ -47,6 +47,39 @@ def _sample_points(points: list[list[float]], limit: int = 24) -> list[list[floa
     return values[selected].astype(float).tolist()
 
 
+def _split_guided_strokes(points: list[list[float]], radius: float, max_groups: int = 6) -> list[list[list[float]]]:
+    """把跨多个物体的长笔迹拆成若干局部提示，避免 SAM 只返回一个主物体。"""
+    strokes: list[list[list[float]]] = []
+    current: list[list[float]] = []
+    for point in points:
+        if len(point) < 2:
+            continue
+        if len(point) >= 3 and bool(point[2]) and current:
+            strokes.append(current)
+            current = []
+        current.append([float(point[0]), float(point[1])])
+    if current:
+        strokes.append(current)
+
+    groups: list[list[list[float]]] = []
+    for stroke in strokes:
+        values = np.asarray(stroke, dtype=np.float32)
+        span = float(np.hypot(np.ptp(values[:, 0]), np.ptp(values[:, 1]))) if len(values) > 1 else 0.0
+        pieces = min(4, max(1, int(np.ceil(span / max(radius * 6, 1)))))
+        if len(stroke) < pieces * 3:
+            pieces = 1
+        for chunk in np.array_split(values, pieces):
+            if len(chunk):
+                groups.append(chunk.astype(float).tolist())
+    if len(groups) <= max_groups:
+        return groups
+    # 组数过多时按顺序合并，仍保留整条笔迹的空间覆盖。
+    merged: list[list[list[float]]] = []
+    for chunk in np.array_split(np.arange(len(groups)), max_groups):
+        merged.append([point for index in chunk for point in groups[int(index)]])
+    return merged
+
+
 def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
     ys, xs = np.where(mask)
     if not len(xs):
@@ -312,9 +345,18 @@ def segment_from_guided_strokes(
 
     # “增加”识别用户新涂到的完整主体，再与原结果合并。不能让新主体覆盖旧主体。
     if positive_points:
-        addition = segment_from_positive_strokes(image_path, positive_points, radius)
-        addition_array = np.asarray(addition.resize(image_size, Image.Resampling.NEAREST).convert("L")) > 64
-        result = np.logical_or(result, addition_array)
+        additions: list[np.ndarray] = []
+        errors: list[Exception] = []
+        for group in _split_guided_strokes(positive_points, radius):
+            try:
+                addition = segment_from_positive_strokes(image_path, group, radius)
+                additions.append(np.asarray(addition.resize(image_size, Image.Resampling.NEAREST).convert("L")) > 64)
+            except Exception as exc:
+                errors.append(exc)
+        if not additions:
+            raise errors[-1] if errors else RuntimeError("未找到与增加笔迹对应的主体")
+        # 每组提示独立识别后再合并，允许一次增加多个互不相连的完整主体。
+        result = np.logical_or(result, np.logical_or.reduce(additions))
 
     # “删除”先识别涂抹处代表的完整物体，再从现有组合中扣除。
     if negative_points:

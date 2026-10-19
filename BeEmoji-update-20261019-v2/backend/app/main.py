@@ -1,0 +1,580 @@
+from __future__ import annotations
+import asyncio
+import logging
+from io import BytesIO
+from pathlib import Path
+import time
+import uuid
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from PIL import Image, ImageChops
+from .config import BAIDU_PROCESS_API_KEY, BAIDU_PROCESS_SECRET_KEY, CORS_ORIGINS, DASHSCOPE_API_KEY, DATA_DIR, EMOJI_AUDIT_TIMEOUT_SECONDS, EMOJI_GENERATION_TARGET_SECONDS, EMOJI_PROMPT_VERSION, MAX_IMAGE_SIDE, MAX_UPLOAD_BYTES, PUBLIC_BASE_URL
+from .image_ops import apply_repair_inside_mask, bbox_from_mask, composite_emoji, cutout, edit_mask_with_brush, emoji_is_visibly_stylized, emoji_matches_source, emoji_style_difference, expand_mask, filter_candidates, is_complete_subject, mask_from_image, match_color_intensity, normalize_image, remove_white_matte, save_png
+from .providers_domestic import audit_emoji_consistency, baidu_segment, classify_subject_category, detect_objects_hybrid, generate_emoji_domestic, repair_background_domestic
+from .local_segmentation import segment_from_detection_box, segment_from_guided_strokes, segment_from_positive_strokes
+from .quality import efficiency_score, load_and_validate, score_candidate
+
+app = FastAPI(title="Object Emoji MVP")
+logger = logging.getLogger("object-emoji")
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.mount("/files", StaticFiles(directory=DATA_DIR), name="files")
+
+
+class RefineRequest(BaseModel):
+    box: list[int] = Field(min_length=4, max_length=4)
+
+
+class PaintRefineRequest(BaseModel):
+    points: list[list[float]] = Field(min_length=1, max_length=4000)
+    radius: float = Field(default=18, ge=2, le=160)
+
+
+class MaskEditRequest(BaseModel):
+    points: list[list[float]] = Field(min_length=1, max_length=4000)
+    radius: float = Field(default=18, ge=2, le=160)
+    mode: str = Field(pattern="^(add|remove)$")
+
+
+class PreciseMaskEditRequest(MaskEditRequest):
+    pass
+
+
+class EmojiRequest(BaseModel):
+    imageId: str
+    objectId: str
+
+
+class CompositionRequest(EmojiRequest):
+    emojiUrl: str
+
+
+class CompositionItem(BaseModel):
+    objectId: str
+    emojiUrl: str
+
+
+class BatchCompositionRequest(BaseModel):
+    imageId: str
+    items: list[CompositionItem] = Field(min_length=1, max_length=8)
+
+
+async def repair_background_with_retry(input_path: Path, bbox: list[int], output_path: Path) -> None:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            await asyncio.wait_for(repair_background_domestic(input_path, bbox, output_path), timeout=180)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                await asyncio.sleep(.8)
+    assert last_error is not None
+    raise last_error
+
+
+async def generate_emoji_with_retry(cutout_path: Path, original_path: Path, output_path: Path, strict: bool = False, correction: str = "", category: str = "food") -> None:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            await asyncio.wait_for(generate_emoji_domestic(cutout_path, original_path, output_path, strict=strict, correction=correction, category=category), timeout=180)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                await asyncio.sleep(.8)
+    assert last_error is not None
+    raise last_error
+
+
+async def extract_transparent_emoji(raw_path: Path) -> Image.Image:
+    """优先使用云端精细抠图；服务异常时保留已生成图片并本地去白底。"""
+    try:
+        rgba = await asyncio.wait_for(baidu_segment(raw_path, None, "rgba"), timeout=12)
+    except Exception as exc:
+        logger.warning("emoji segmentation degraded to local matte removal: %s", exc)
+        rgba = Image.open(raw_path).convert("RGBA")
+        if rgba.getchannel("A").getextrema() == (255, 255):
+            red, green, blue = rgba.convert("RGB").split()
+            distance_from_white = ImageChops.lighter(
+                ImageChops.invert(red),
+                ImageChops.lighter(ImageChops.invert(green), ImageChops.invert(blue)),
+            )
+            rgba.putalpha(distance_from_white.point(lambda value: min(255, value * 4)))
+    return remove_white_matte(rgba)
+
+
+async def audit_emoji_safely(source_path: Path, emoji_path: Path, category: str = "food") -> tuple[bool, str, str, str]:
+    """审核服务只影响候选排序，不影响已经成功生成的图片返回。"""
+    try:
+        return await asyncio.wait_for(
+            audit_emoji_consistency(source_path, emoji_path, category=category),
+            timeout=EMOJI_AUDIT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning("emoji audit unavailable; accepting candidate with weak quality: %s", exc)
+        return True, "审核服务暂不可用", "3D_EMOJI", "WEAK"
+
+
+def background_cache_path(folder: Path, object_id: str) -> Path:
+    mask_path = folder / f"mask_{object_id}.png"
+    version = mask_path.stat().st_mtime_ns
+    return folder / f"background_{object_id}_{version}.png"
+
+
+def choose_first_candidate(first_report, retry_report, *, first_acceptable: bool, retry_acceptable: bool) -> bool:
+    """完整一致性优先于图片可解码性和软评分，避免选回姿态错误的高分首图。"""
+    if retry_report is None:
+        return True
+    if first_acceptable != retry_acceptable:
+        return first_acceptable
+    if first_report.valid != retry_report.valid:
+        return first_report.valid
+    return first_report.total > retry_report.total
+
+
+async def ensure_background_cache(folder: Path, object_id: str, input_path: Path) -> tuple[Path, bool]:
+    cache_path = background_cache_path(folder, object_id)
+    if cache_path.exists():
+        return cache_path, True
+    mask = Image.open(folder / f"mask_{object_id}.png").convert("L")
+    try:
+        await repair_background_with_retry(input_path, list(bbox_from_mask(mask)), cache_path)
+    except Exception:
+        cache_path.unlink(missing_ok=True)
+        raise
+    return cache_path, False
+
+
+def item_dir(image_id: str) -> Path:
+    path = DATA_DIR / image_id
+    if not path.exists():
+        raise HTTPException(404, "图片任务不存在")
+    return path
+
+
+def file_url(path: Path) -> str:
+    relative = "/files/" + path.relative_to(DATA_DIR).as_posix()
+    return PUBLIC_BASE_URL + relative if PUBLIC_BASE_URL else relative
+
+
+def provider_error_message(exc: Exception) -> str:
+    message = str(exc)
+    if "17" in message and "limit" in message.lower():
+        return "百度智能抠图今日额度已用完，请开通付费或等待额度恢复"
+    return message or type(exc).__name__
+
+
+def object_payload(image_id: str, object_id: str) -> dict:
+    folder = item_dir(image_id)
+    mask_path = folder / f"mask_{object_id}.png"
+    preview_path = folder / f"preview_{object_id}.png"
+    if not mask_path.exists():
+        raise HTTPException(404, "主体不存在")
+    mask = Image.open(mask_path).convert("L")
+    version = mask_path.stat().st_mtime_ns
+    return {"id": object_id, "maskUrl": f"{file_url(mask_path)}?v={version}", "previewUrl": f"{file_url(preview_path)}?v={version}", "bbox": list(bbox_from_mask(mask))}
+
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
+
+
+@app.get("/api/health/providers")
+async def provider_health():
+    """启动器使用的轻量检查：验证配置存在且两个第三方域名可连接。"""
+    import httpx
+    configured = bool(DASHSCOPE_API_KEY and BAIDU_PROCESS_API_KEY and BAIDU_PROCESS_SECRET_KEY)
+    results: dict[str, bool] = {"dashscope": False, "baidu": False}
+    if configured:
+        async with httpx.AsyncClient(timeout=12) as client:
+            for name, url in (
+                ("dashscope", "https://dashscope.aliyuncs.com/"),
+                ("baidu", "https://aip.baidubce.com/"),
+            ):
+                try:
+                    response = await client.get(url)
+                    results[name] = response.status_code < 500
+                except Exception:
+                    results[name] = False
+    return {"ok": configured and all(results.values()), "configured": configured, "providers": results}
+
+
+@app.post("/api/images")
+async def upload_image(file: UploadFile = File(...)):
+    if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(415, "仅支持 JPG、PNG 和 WebP")
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "图片不能超过 15MB")
+    image_id = uuid.uuid4().hex[:16]
+    folder = DATA_DIR / image_id; folder.mkdir(parents=True)
+    try:
+        image = normalize_image(raw, MAX_IMAGE_SIDE)
+    except Exception as exc:
+        raise HTTPException(400, "图片文件无法读取") from exc
+    original_path = folder / "original.png"; save_png(image, original_path)
+    return {"imageId": image_id, "imageUrl": file_url(original_path), "width": image.width, "height": image.height, "objects": []}
+
+
+@app.post("/api/images/{image_id}/detect")
+async def detect_image(image_id: str):
+    folder = item_dir(image_id); original_path = folder / "original.png"
+    image = Image.open(original_path).convert("RGB")
+    detection_warning = ""
+    detections = []
+    masks = []
+    labels = []
+    scores = []
+    try:
+        detections = await detect_objects_hybrid(original_path)
+        for detection in detections:
+            try:
+                masks.append(await asyncio.to_thread(segment_from_detection_box, original_path, detection["box"]))
+                labels.append(detection["label"])
+                scores.append(detection["score"])
+            except Exception:
+                continue
+        if not masks:
+            detection_warning = "自动识别暂时失败，请使用涂抹工具选择主体"
+        masks = [mask for mask in filter_candidates(masks, image.size, limit=8) if is_complete_subject(mask, image.size)]
+        if not masks:
+            detection_warning = "未找到完整独立主体，请使用涂抹工具选择主体"
+    except Exception as exc:
+        detection_warning = "自动识别失败啦，再试一次吧"
+    objects = []
+    for index, mask in enumerate(masks):
+        object_id = f"{index + 1:02d}"
+        mask_path = folder / f"mask_{object_id}.png"; save_png(mask, mask_path)
+        preview, _ = cutout(image, mask); save_png(preview, folder / f"preview_{object_id}.png")
+        payload = object_payload(image_id, object_id)
+        mask_box = list(bbox_from_mask(mask))
+        matched = min(range(len(detections)), key=lambda i: sum(abs(a-b) for a,b in zip(mask_box, detections[i]["box"]))) if detections else -1
+        payload["label"] = labels[matched] if matched >= 0 else "主体"
+        payload["score"] = scores[matched] if matched >= 0 else 0
+        objects.append(payload)
+    return {"imageId": image_id, "imageUrl": file_url(original_path), "width": image.width, "height": image.height, "objects": objects, "detectionWarning": detection_warning}
+
+
+@app.post("/api/images/{image_id}/refine")
+async def refine(image_id: str, request: RefineRequest):
+    folder = item_dir(image_id); original_path = folder / "original.png"
+    image = Image.open(original_path).convert("RGB")
+    try:
+        result = await baidu_segment(original_path, request.box, "mask")
+        mask = mask_from_image(result, image.size)
+        bbox_from_mask(mask)
+    except Exception as exc:
+        raise HTTPException(502, f"框选分割失败：{type(exc).__name__}") from exc
+    object_id = "r" + uuid.uuid4().hex[:6]
+    save_png(mask, folder / f"mask_{object_id}.png")
+    preview, _ = cutout(image, mask); save_png(preview, folder / f"preview_{object_id}.png")
+    return object_payload(image_id, object_id)
+
+
+@app.post("/api/images/{image_id}/refine-paint")
+async def refine_paint(image_id: str, request: PaintRefineRequest):
+    started = time.perf_counter()
+    folder = item_dir(image_id); original_path = folder / "original.png"
+    image = Image.open(original_path).convert("RGB")
+    if any(len(point) != 2 for point in request.points):
+        raise HTTPException(422, "涂抹坐标格式错误")
+    try:
+        mask = await asyncio.to_thread(segment_from_positive_strokes, original_path, request.points, request.radius)
+    except Exception as exc:
+        logger.exception("paint segmentation failed image_id=%s", image_id)
+        message = str(exc)
+        if "完整主体" in message or "覆盖" in message or "返回主体" in message:
+            detail = "没有找到完整主体，请换个位置简单涂几笔"
+        else:
+            detail = "抠图模型运行失败啦，再试一次吧"
+        raise HTTPException(502, detail) from exc
+    object_id = "p" + uuid.uuid4().hex[:6]
+    save_png(mask, folder / f"mask_{object_id}.png")
+    preview, _ = cutout(image, mask); save_png(preview, folder / f"preview_{object_id}.png")
+    payload = object_payload(image_id, object_id)
+    payload["label"] = "手动涂抹主体"; payload["score"] = 1.0
+    logger.info("paint segmentation image_id=%s elapsed_ms=%d", image_id, round((time.perf_counter()-started)*1000))
+    return payload
+
+
+@app.post("/api/images/{image_id}/masks/{object_id}/edit")
+async def edit_object_mask(image_id: str, object_id: str, request: MaskEditRequest):
+    folder = item_dir(image_id)
+    original = Image.open(folder / "original.png").convert("RGB")
+    mask_path = folder / f"mask_{object_id}.png"
+    if not mask_path.exists():
+        raise HTTPException(404, "主体不存在")
+    try:
+        current_mask = Image.open(mask_path).convert("L")
+        stroke_points = [[point[0], point[1]] for point in request.points if len(point) >= 2]
+        edited = await asyncio.to_thread(
+            segment_from_guided_strokes,
+            folder / "original.png",
+            current_mask,
+            stroke_points if request.mode == "add" else [],
+            stroke_points if request.mode == "remove" else [],
+            request.radius,
+        )
+        bbox_from_mask(edited)
+    except Exception as exc:
+        logger.exception("smart mask edit failed image_id=%s object_id=%s mode=%s", image_id, object_id, request.mode)
+        raise HTTPException(422, "智能修正没有找到合适边界，请换个位置再画一笔") from exc
+    save_png(edited, mask_path)
+    preview, _ = cutout(original, edited)
+    save_png(preview, folder / f"preview_{object_id}.png")
+    payload = object_payload(image_id, object_id)
+    payload["label"] = "智能修正主体"
+    payload["score"] = 1.0
+    return payload
+
+
+@app.post("/api/images/{image_id}/masks/{object_id}/precise-edit")
+async def precise_edit_object_mask(image_id: str, object_id: str, request: PreciseMaskEditRequest):
+    """像素级兜底工具；只在智能修正无法满足用户意图时使用。"""
+    folder = item_dir(image_id)
+    original = Image.open(folder / "original.png").convert("RGB")
+    mask_path = folder / f"mask_{object_id}.png"
+    if not mask_path.exists():
+        raise HTTPException(404, "主体不存在")
+    try:
+        edited = edit_mask_with_brush(Image.open(mask_path), request.points, request.radius, request.mode)
+        bbox_from_mask(edited)
+    except Exception as exc:
+        raise HTTPException(422, "精细画笔修改失败啦，再试一次吧") from exc
+    save_png(edited, mask_path)
+    preview, _ = cutout(original, edited)
+    save_png(preview, folder / f"preview_{object_id}.png")
+    payload = object_payload(image_id, object_id)
+    payload["label"] = "精细修正主体"
+    payload["score"] = 1.0
+    return payload
+
+
+@app.post("/api/emojis")
+async def make_emoji(request: EmojiRequest):
+    started = time.perf_counter(); folder = item_dir(request.imageId)
+    metrics = {"firstImageMs": 0, "auditMs": 0, "retryMs": 0, "totalMs": 0}
+    original_path = folder / "original.png"
+    original = Image.open(original_path).convert("RGB")
+    mask = Image.open(folder / f"mask_{request.objectId}.png").convert("L")
+    cutout_image, _ = cutout(original, mask, padding=40)
+    cutout_path = folder / f"cutout_{request.objectId}.png"; save_png(cutout_image, cutout_path)
+    raw_path = folder / f"styled_{request.objectId}.png"
+    output_path = folder / f"emoji_{request.objectId}_{uuid.uuid4().hex[:6]}.png"
+    try:
+        try:
+            category = await asyncio.wait_for(classify_subject_category(cutout_path), timeout=30)
+        except Exception as exc:
+            category = "food"
+            logger.warning("subject category unavailable; falling back to food references: %s", exc)
+        # 每次点击都重新生成，避免提示词或蒙版改变后仍复用旧缓存。
+        generation_started = time.perf_counter()
+        stage_started = time.perf_counter()
+        await generate_emoji_with_retry(cutout_path, original_path, raw_path, category=category)
+        load_and_validate(raw_path)
+        logger.info("emoji stage image_id=%s object_id=%s stage=generate elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
+        # 云端精细抠图异常时降级为本地去白底，避免已有生成图被丢弃。
+        stage_started = time.perf_counter()
+        transparent = await extract_transparent_emoji(raw_path)
+        metrics["firstImageMs"] = round((time.perf_counter()-generation_started)*1000)
+        logger.info("emoji stage image_id=%s object_id=%s stage=cutout elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
+        audit_path = folder / f"audit_{request.objectId}.png"; save_png(transparent, audit_path)
+        stage_started = time.perf_counter()
+        semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path, category)
+        metrics["auditMs"] += round((time.perf_counter()-stage_started)*1000)
+        logger.info("emoji stage image_id=%s object_id=%s stage=audit elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
+        structure_ok = emoji_matches_source(transparent, cutout_image)
+        visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
+        style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
+        style_ok = style_acceptable
+        audit_available = semantic_reason != "审核服务暂不可用"
+        first_report = score_candidate(transparent, cutout_image, semantic_ok=semantic_ok, style_class=style_class, style_quality=style_quality, audit_available=audit_available, audit_reason=semantic_reason)
+        selected_report = first_report
+        retried = False
+        if not first_report.valid or not structure_ok or not style_acceptable or not semantic_ok:
+            first_candidate = transparent.copy()
+            first_structure_ok, first_semantic_ok = structure_ok, semantic_ok
+            first_style_acceptable = style_acceptable
+            first_style_class = style_class
+            first_style_quality = style_quality
+            first_style_score = emoji_style_difference(first_candidate, cutout_image)
+            first_acceptable = first_report.valid and first_structure_ok and first_semantic_ok and first_style_acceptable
+            first_path = folder / f"audit_{request.objectId}_first.png"
+            save_png(transparent, first_path)
+            corrections: list[str] = []
+            if not first_report.valid:
+                corrections.append("修复无效输出：" + "、".join(first_report.invalid_reasons))
+            if not structure_ok:
+                corrections.append("完整保留原主体外轮廓、长宽比例和所有主要组成部分，不能缺边、扩大或改变形状")
+            if not style_acceptable:
+                if style_class == "FLAT_CARTOON":
+                    corrections.append("上一版是二维漫画风；彻底移除描边、勾线、赛璐璐阴影和平面色块，严格改为参考图3至图5的苹果系统圆润半立体 Emoji 材质")
+                elif style_class == "PHOTOREALISTIC":
+                    corrections.append("上一版仍过于写实；显著增强圆润半立体 Emoji 重绘效果并概括摄影纹理")
+                elif style_class == "3D_EMOJI" and style_quality == "WEAK":
+                    corrections.append("上一版只有较弱的 Emoji 化；增强圆润饱满体积、柔和高光和环境遮蔽，统一各组成物材质，去除轻微描边、平面渐变和残余照片纹理")
+                else:
+                    corrections.append("严格使用参考图3至图5的苹果系统圆润半立体 Emoji 风格，无描边、连续柔和渐变、自然高光和轻微环境遮蔽")
+            if not semantic_ok:
+                corrections.append(f"修复主体一致性错误：{semantic_reason or '不得改变镜头角度、姿态、透视、遮挡或主要实体'}。严格恢复图1的 yaw、pitch、roll、头身朝向、身体轴线、四肢位置、前后层级和透视缩短；禁止正面化、左右对称化、扶正或改成标准姿势")
+            logger.info(
+                "emoji first candidate rejected image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
+                request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
+            )
+            try:
+                retried = True
+                retry_started = time.perf_counter()
+                stage_started = time.perf_counter()
+                await generate_emoji_with_retry(cutout_path, original_path, raw_path, strict=True, correction="；".join(corrections), category=category)
+                load_and_validate(raw_path)
+                logger.info("emoji stage image_id=%s object_id=%s stage=retry_generate elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
+                stage_started = time.perf_counter()
+                transparent = await extract_transparent_emoji(raw_path)
+                logger.info("emoji stage image_id=%s object_id=%s stage=retry_cutout elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
+                save_png(transparent, audit_path)
+                stage_started = time.perf_counter()
+                semantic_ok, semantic_reason, style_class, style_quality = await audit_emoji_safely(cutout_path, audit_path, category)
+                metrics["auditMs"] += round((time.perf_counter()-stage_started)*1000)
+                logger.info("emoji stage image_id=%s object_id=%s stage=retry_audit elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-stage_started)*1000))
+                structure_ok = emoji_matches_source(transparent, cutout_image)
+                visibly_stylized = emoji_is_visibly_stylized(transparent, cutout_image)
+                style_acceptable = style_class == "3D_EMOJI" and style_quality in {"GOOD", "WEAK"} and visibly_stylized
+                style_ok = style_acceptable
+                retry_style_score = emoji_style_difference(transparent, cutout_image)
+                audit_available = semantic_reason != "审核服务暂不可用"
+                retry_report = score_candidate(transparent, cutout_image, semantic_ok=semantic_ok, style_class=style_class, style_quality=style_quality, audit_available=audit_available, audit_reason=semantic_reason)
+                metrics["retryMs"] = round((time.perf_counter()-retry_started)*1000)
+                logger.info(
+                    "emoji correction candidate image_id=%s object_id=%s structure_ok=%s style_ok=%s semantic_ok=%s reason=%s",
+                    request.imageId, request.objectId, structure_ok, style_ok, semantic_ok, f"{style_class}/{style_quality}: {semantic_reason}",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "emoji correction failed; returning first candidate image_id=%s object_id=%s error=%s",
+                    request.imageId, request.objectId, exc,
+                )
+                transparent = first_candidate
+                structure_ok, semantic_ok = first_structure_ok, first_semantic_ok
+                style_class = first_style_class
+                style_quality = first_style_quality
+                style_acceptable = first_style_acceptable
+                retry_style_score = -1
+                retry_report = None
+            # 硬校验优先；两个都有效时再比较四维软评分。审核超时仅降低置信度，不隐藏图片。
+            retry_acceptable = bool(retry_report and retry_report.valid and structure_ok and semantic_ok and style_acceptable)
+            choose_first = choose_first_candidate(
+                first_report,
+                retry_report,
+                first_acceptable=first_acceptable,
+                retry_acceptable=retry_acceptable,
+            )
+            if choose_first:
+                transparent = first_candidate
+                structure_ok, semantic_ok = first_structure_ok, first_semantic_ok
+                style_class = first_style_class
+                style_quality = first_style_quality
+                style_acceptable = first_style_acceptable
+                selected_report = first_report
+                logger.info(
+                    "emoji selected first candidate image_id=%s object_id=%s first_score=%.2f retry_score=%.2f",
+                    request.imageId, request.objectId, first_report.total, retry_report.total if retry_report else -1,
+                )
+            else:
+                selected_report = retry_report
+            if not structure_ok or not semantic_ok or not style_acceptable:
+                logger.warning(
+                    "emoji returning best available candidate image_id=%s object_id=%s structure_ok=%s semantic_ok=%s style=%s/%s",
+                    request.imageId, request.objectId, structure_ok, semantic_ok, style_class, style_quality,
+                )
+        if not selected_report.valid:
+            raise ValueError("两次生成均未通过硬性图片有效性校验：" + "、".join(selected_report.invalid_reasons))
+        # 不再进行九宫格颜色校正；该步骤会造成明显矩形色块。
+        save_png(match_color_intensity(transparent, cutout_image), output_path)
+        logger.info("emoji generation image_id=%s object_id=%s elapsed_ms=%d", request.imageId, request.objectId, round((time.perf_counter()-generation_started)*1000))
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(504, "Emoji 生成服务响应超时，请再试一次") from exc
+    except Exception as exc:
+        message = provider_error_message(exc)
+        lower = message.lower()
+        if "429" in lower or "rate" in lower or "thrott" in lower:
+            detail = "图片生成服务繁忙，请稍后再试"
+        elif any(word in lower for word in ("quota", "balance", "insufficient", "额度", "余额")):
+            detail = "图片生成额度不足，请检查服务余额"
+        elif "connect" in lower or "network" in lower:
+            detail = "无法连接图片生成服务，请检查网络后重试"
+        else:
+            detail = f"风格化生成失败：{message[:180]}"
+        raise HTTPException(502, detail) from exc
+    metrics["totalMs"] = round((time.perf_counter()-started)*1000)
+    return {
+        "emojiUrl": file_url(output_path),
+        "elapsedMs": metrics["totalMs"],
+        "promptVersion": EMOJI_PROMPT_VERSION,
+        "category": category,
+        "retried": retried,
+        "quality": selected_report.as_dict(),
+        "timings": metrics,
+        "generationEfficiencyScore": efficiency_score(metrics["totalMs"], EMOJI_GENERATION_TARGET_SECONDS),
+    }
+
+
+@app.post("/api/compositions")
+async def compose(request: CompositionRequest):
+    started = time.perf_counter(); folder = item_dir(request.imageId)
+    original_path = folder / "original.png"
+    mask = Image.open(folder / f"mask_{request.objectId}.png").convert("L")
+    try:
+        repaired_path, cache_hit = await ensure_background_cache(folder, request.objectId, original_path)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(504, "背景修复超过 60 秒；透明 Emoji 仍可下载") from exc
+    except Exception as exc:
+        raise HTTPException(502, f"背景修复失败：{type(exc).__name__}") from exc
+    emoji_name = Path(request.emojiUrl.split("?")[0]).name
+    emoji_path = folder / emoji_name
+    if not emoji_path.exists():
+        raise HTTPException(404, "Emoji 文件不存在")
+    original = Image.open(original_path).convert("RGBA")
+    repaired = apply_repair_inside_mask(original, Image.open(repaired_path), mask)
+    emoji = Image.open(emoji_path).convert("RGBA")
+    result = composite_emoji(repaired, emoji, bbox_from_mask(mask), add_shadow=False, target_mask=mask)
+    result_path = folder / f"result_{request.objectId}_{uuid.uuid4().hex[:6]}.png"; save_png(result, result_path)
+    logger.info("composition image_id=%s object_id=%s background_cache_hit=%s elapsed_ms=%d", request.imageId, request.objectId, cache_hit, round((time.perf_counter()-started)*1000))
+    return {"resultUrl": file_url(result_path), "repairedUrl": file_url(repaired_path), "elapsedMs": round((time.perf_counter()-started)*1000)}
+
+
+@app.post("/api/compositions/batch")
+async def compose_batch(request: BatchCompositionRequest):
+    """从原图非破坏地重放最多两个主体替换，支持删除任一替换后重新组合。"""
+    started = time.perf_counter(); folder = item_dir(request.imageId)
+    current = Image.open(folder / "original.png").convert("RGBA")
+    run_id = uuid.uuid4().hex[:6]
+    for index, item in enumerate(request.items):
+        mask_path = folder / f"mask_{item.objectId}.png"
+        emoji_path = folder / Path(item.emojiUrl.split("?")[0]).name
+        if not mask_path.exists() or not emoji_path.exists():
+            raise HTTPException(404, "主体或 Emoji 文件不存在")
+        mask = Image.open(mask_path).convert("L")
+        input_path = folder / f"batch_input_{run_id}_{index}.png"
+        save_png(current.convert("RGB"), input_path)
+        try:
+            if index == 0:
+                repaired_path, cache_hit = await ensure_background_cache(folder, item.objectId, input_path)
+            else:
+                repaired_path = folder / f"batch_repaired_{run_id}_{index}.png"
+                await repair_background_with_retry(input_path, list(bbox_from_mask(mask)), repaired_path)
+                cache_hit = False
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(504, "多主体背景修复超时") from exc
+        except Exception as exc:
+            raise HTTPException(502, f"多主体背景修复失败：{type(exc).__name__}") from exc
+        repaired = apply_repair_inside_mask(current, Image.open(repaired_path), mask)
+        emoji = Image.open(emoji_path).convert("RGBA")
+        current = composite_emoji(repaired, emoji, bbox_from_mask(mask), add_shadow=False, target_mask=mask)
+        logger.info("batch composition image_id=%s object_id=%s index=%d background_cache_hit=%s", request.imageId, item.objectId, index, cache_hit)
+        input_path.unlink(missing_ok=True)
+    result_path = folder / f"result_batch_{run_id}.png"
+    save_png(current, result_path)
+    return {"resultUrl": file_url(result_path), "elapsedMs": round((time.perf_counter()-started)*1000)}
